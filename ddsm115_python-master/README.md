@@ -8,4 +8,4 @@ This is a python module to easily connect with DDSM115 direct drive small brushl
 - `sudo python3 setup.py install`
 
 ### Reference
-[Link to reference](https://github.com/rasheeddo/ddsm115_python.git)
+Cited from rasheeddo - [Link to reference](https://github.com/rasheeddo/ddsm115_python.git)
