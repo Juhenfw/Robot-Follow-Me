@@ -1,167 +1,133 @@
-import serial
+import serial  
+import math  
+import numpy as np  
+from scipy import optimize  
+import logging  
+import threading  
+import time  
 
-import math
-
-
-
-port = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
-
-baudrate = 115200
-
-timeout = 1
-
-
-
-L = 65  # Panjang robot
-
-W = 35  # Lebar robot
-
-
-
-anchors = {
-
-    "A0": (-L / 2, W / 2),  # Depan kiri
-
-    "A1": (-L / 2, -W / 2),  # Depan kanan
-
-    "A2": (L / 2, 0),  # Belakang tengah
-
-}
-
-
-
-def calculate_tag_position(distances):
-
-    weights = []
-
-    x_tag, y_tag = 0, 0
-
-    total_weight = 0  # Perlu variabel total_weight untuk normalisasi
-
-    for i, (anchor, dist) in enumerate(zip(anchors.values(), distances)):
-
-        if dist <= 0:  # Pastikan jarak valid (tidak negatif atau nol)
-
-            continue
-
-        x, y = anchor
-
-        weight = 1 / dist  # Bobot invers jarak
-
-        weights.append(weight)
-
-        x_tag += x * weight
-
-        y_tag += y * weight
-
-        total_weight += weight  # Penambahan ke total_weight
-
-    if total_weight > 0:
-
-        x_tag /= total_weight
-
-        y_tag /= total_weight
-
-    return x_tag, y_tag
-
-
-
-
-
-def calculate_distance_and_angle(x_tag, y_tag):
-
-    distance = math.sqrt(x_tag**2 + y_tag**2)
-
-    angle = math.degrees(math.atan2(y_tag, x_tag))  # Menghitung sudut
-
-    return distance, angle
-
-
-
-try:
-
-    ser = serial.Serial(port, baudrate, timeout=timeout)
-
-    while True:
-
-        if ser.in_waiting > 0:
-
-            data = ser.readline().decode("utf-8").strip()
-
-            if data.startswith("$KT0"):
-
-                try:
-
-                    parts = data.split(",")
-
-                    if len(parts) >= 4:
-
-                        raw_values = parts[1:4]
-
-                        processed_values = []
-
-                        for value in raw_values:
-
-                            if value.lower() == "null":
-
-                                processed_values.append(0.0)
-
-                            else:
-
-                                processed_values.append(float(value))
-
+class UWBPositioning:  
+    def __init__(self, port="/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",   
+                 baudrate=115200,   
+                 timeout=1):  
+        # Konfigurasi parameter robot  
+        self.L = 65  # Panjang robot  
+        self.W = 35  # Lebar robot  
+        
+        # Konfigurasi anchor  
+        self.anchors = {  
+            "A0": (-self.L / 2, self.W / 2),   # Depan kiri  
+            "A1": (-self.L / 2, -self.W / 2),  # Depan kanan  
+            "A2": (self.L / 2, 0),             # Belakang tengah  
+        }  
+        
+        # Konfigurasi serial  
+        self.port = port  
+        self.baudrate = baudrate  
+        self.timeout = timeout  
+        
+        # Setup logging  
+        logging.basicConfig(level=logging.INFO,   
+                            format='%(asctime)s - %(levelname)s: %(message)s')  
+        self.logger = logging.getLogger(__name__)  
+        
+        # Variabel untuk filter dan validasi  
+        self.distance_history = []  
+        self.max_history_length = 5  
+        
+    def trilateration(self, distances):  
+        """  
+        Metode trilaterasi dengan optimasi untuk posisi tag  
+        """  
+        def objective_function(pos):  
+            return sum((np.linalg.norm(pos - np.array(anchor)) - dist)**2   
+                       for anchor, dist in zip(list(self.anchors.values()), distances))  
+        
+        initial_guess = [0, 0]  
+        result = optimize.minimize(objective_function, initial_guess, method='Nelder-Mead')  
+        
+        return result.x  
+    
+    def kalman_filter(self, new_distance):  
+        """  
+        Sederhana Kalman filter untuk stabilisasi pembacaan jarak  
+        """  
+        if len(self.distance_history) < self.max_history_length:  
+            self.distance_history.append(new_distance)  
+            return new_distance  
+        
+        # Rata-rata bergerak  
+        self.distance_history.pop(0)  
+        self.distance_history.append(new_distance)  
+        return np.mean(self.distance_history)  
+    
+    def process_uwb_data(self, raw_data):  
+        """  
+        Proses data UWB dengan validasi dan filter  
+        """  
+        try:  
+            parts = raw_data.split(",")  
+            if len(parts) < 4 or not parts[0].startswith("$KT0"):  
+                self.logger.warning("Invalid data format")  
+                return None  
+            
+            # Konversi dan filter data  
+            distances = []  
+            for value in parts[1:4]:  
+                if value.lower() == "null":  
+                    distances.append(0.0)  
+                else:  
+                    dist = float(value) * 100  # Konversi ke cm  
+                    distances.append(self.kalman_filter(dist))  
+            
+            # Trilaterasi  
+            x_tag, y_tag = self.trilateration(distances)  
+            
+            # Perhitungan jarak dan sudut  
+            distance = np.linalg.norm([x_tag, y_tag])  
+            angle = np.degrees(np.arctan2(y_tag, x_tag))  
+            
+            return {  
+                "distances": distances,  
+                "position": (x_tag, y_tag),  
+                "distance": distance,  
+                "angle": angle  
+            }  
+        
+        except Exception as e:  
+            self.logger.error(f"Error processing data: {e}")  
+            return None  
+    
+    def start_uwb_reading(self):  
+        """  
+        Pembacaan serial dengan thread terpisah  
+        """  
+        try:  
+            with serial.Serial(self.port, self.baudrate, timeout=self.timeout) as ser:  
+                self.logger.info("UWB Serial connection established")  
+                
+                while True:  
+                    if ser.in_waiting > 0:  
+                        data = ser.readline().decode("utf-8").strip()  
+                        result = self.process_uwb_data(data)  
                         
-
-                        # Skala jarak sensor menjadi satuan sentimeter
-
-                        A0, A1, A2 = [val * 100 for val in processed_values]
-
+                        if result:  
+                            self.logger.info(  
+                                f"A0: {result['distances'][0]:.2f} cm | "  
+                                f"A1: {result['distances'][1]:.2f} cm | "  
+                                f"A2: {result['distances'][2]:.2f} cm | "  
+                                f"Distance: {result['distance']:.2f} cm | "  
+                                f"Angle: {result['angle']:.2f}°"  
+                            )  
                         
+                        time.sleep(0.1)  # Menghindari pembacaan berlebihan  
+        
+        except serial.SerialException as e:  
+            self.logger.error(f"Serial connection error: {e}")  
+        
+def main():  
+    uwb_tracker = UWBPositioning()  
+    uwb_tracker.start_uwb_reading()  
 
-                        # Debugging: Tampilkan jarak yang diterima
-
-                        print(f"A0: {A0} cm | A1: {A1} cm | A2: {A2} cm")
-
-
-
-                        # Hitung posisi tag berdasarkan jarak
-
-                        x_tag, y_tag = calculate_tag_position([A0, A1, A2])
-
-                        
-
-                        # Hitung jarak dan sudut
-
-                        distance, angle = calculate_distance_and_angle(x_tag, y_tag)
-
-
-
-                        # Debugging: Tampilkan hasil perhitungan
-
-                        print(f"Posisi Tag: ({x_tag:.2f}, {y_tag:.2f})")
-
-                        print(
-
-                            f"A0 = {A0:.2f} cm | A1 = {A1:.2f} cm | A2 = {A2:.2f} cm | T0 to Robot = {distance:.2f} cm | Sudut = {angle:.2f}ï¿½"
-
-                        )
-
-                    else:
-
-                        print("Error: Data tidak lengkap.")
-
-                except ValueError as e:
-
-                    print(f"Error processing data: {e}")
-
-except serial.SerialException as e:
-
-    print(f"Error: {e}")
-
-finally:
-
-    if "ser" in locals() and ser.is_open:
-
-        ser.close()
-
-        print("Serial connection closed.")
+if __name__ == "__main__":  
+    main()
