@@ -3,7 +3,6 @@ import math
 import numpy as np  
 from scipy import optimize  
 import logging  
-import threading  
 import time  
 
 class UWBPositioning:  
@@ -27,104 +26,113 @@ class UWBPositioning:
         self.timeout = timeout  
         
         # Setup logging  
-        logging.basicConfig(level=logging.INFO,   
+        logging.basicConfig(level=logging.DEBUG,   
                             format='%(asctime)s - %(levelname)s: %(message)s')  
         self.logger = logging.getLogger(__name__)  
         
-        # Variabel untuk filter dan validasi  
-        self.distance_history = []  
-        self.max_history_length = 5  
-        
-    def trilateration(self, distances):  
-        """  
-        Metode trilaterasi dengan optimasi untuk posisi tag  
-        """  
-        def objective_function(pos):  
-            return sum((np.linalg.norm(pos - np.array(anchor)) - dist)**2   
-                       for anchor, dist in zip(list(self.anchors.values()), distances))  
-        
-        initial_guess = [0, 0]  
-        result = optimize.minimize(objective_function, initial_guess, method='Nelder-Mead')  
-        
-        return result.x  
-    
-    def kalman_filter(self, new_distance):  
-        """  
-        Sederhana Kalman filter untuk stabilisasi pembacaan jarak  
-        """  
-        if len(self.distance_history) < self.max_history_length:  
-            self.distance_history.append(new_distance)  
-            return new_distance  
-        
-        # Rata-rata bergerak  
-        self.distance_history.pop(0)  
-        self.distance_history.append(new_distance)  
-        return np.mean(self.distance_history)  
-    
     def process_uwb_data(self, raw_data):  
         """  
-        Proses data UWB dengan validasi dan filter  
+        Proses data UWB dengan debugging tambahan  
         """  
         try:  
-            parts = raw_data.split(",")  
-            if len(parts) < 4 or not parts[0].startswith("$KT0"):  
-                self.logger.warning("Invalid data format")  
-                return None  
+            # Debug: Print raw data untuk melihat format aktual  
+            self.logger.debug(f"Raw data received: {raw_data}")  
             
-            # Konversi dan filter data  
-            distances = []  
-            for value in parts[1:4]:  
-                if value.lower() == "null":  
-                    distances.append(0.0)  
-                else:  
-                    dist = float(value) * 100  # Konversi ke cm  
-                    distances.append(self.kalman_filter(dist))  
+            # Coba berbagai kemungkinan pemisah  
+            separators = [',', ';', '\t', ' ']  
             
-            # Trilaterasi  
-            x_tag, y_tag = self.trilateration(distances)  
+            for sep in separators:  
+                parts = raw_data.split(sep)  
+                
+                # Debug: Print parts yang dihasilkan  
+                self.logger.debug(f"Parts using separator '{sep}': {parts}")  
+                
+                # Cek format yang mungkin  
+                if len(parts) >= 4 and ('$KT0' in parts[0] or 'KT0' in parts[0]):  
+                    # Ekstrak jarak  
+                    try:  
+                        distances = []  
+                        for value in parts[1:4]:  
+                            # Bersihkan dari karakter non-numerik  
+                            cleaned_value = ''.join(  
+                                char for char in value   
+                                if char.isdigit() or char in '.-'  
+                            )  
+                            
+                            # Konversi ke float  
+                            if cleaned_value:  
+                                dist = float(cleaned_value) * 100  # Konversi ke cm  
+                                distances.append(dist)  
+                            else:  
+                                distances.append(0.0)  
+                        
+                        # Debug: Print jarak yang diekstrak  
+                        self.logger.debug(f"Extracted distances: {distances}")  
+                        
+                        return distances  
+                    
+                    except Exception as e:  
+                        self.logger.error(f"Error parsing distances: {e}")  
             
-            # Perhitungan jarak dan sudut  
-            distance = np.linalg.norm([x_tag, y_tag])  
-            angle = np.degrees(np.arctan2(y_tag, x_tag))  
-            
-            return {  
-                "distances": distances,  
-                "position": (x_tag, y_tag),  
-                "distance": distance,  
-                "angle": angle  
-            }  
+            # Jika tidak ada format yang cocok  
+            self.logger.warning(f"No valid format found for data: {raw_data}")  
+            return None  
         
         except Exception as e:  
-            self.logger.error(f"Error processing data: {e}")  
+            self.logger.error(f"Unexpected error processing data: {e}")  
             return None  
     
     def start_uwb_reading(self):  
         """  
-        Pembacaan serial dengan thread terpisah  
+        Pembacaan serial dengan debugging komprehensif  
         """  
         try:  
-            with serial.Serial(self.port, self.baudrate, timeout=self.timeout) as ser:  
-                self.logger.info("UWB Serial connection established")  
+            # Buka serial dengan mode debugging  
+            ser = serial.Serial(  
+                port=self.port,   
+                baudrate=self.baudrate,   
+                timeout=self.timeout  
+            )  
+            self.logger.info("UWB Serial connection established")  
+            
+            while True:  
+                try:  
+                    # Baca data mentah  
+                    raw_data = ser.readline()  
+                    
+                    # Dekode dengan berbagai encoding  
+                    encodings = ['utf-8', 'ascii', 'latin-1']  
+                    decoded_data = None  
+                    
+                    for encoding in encodings:  
+                        try:  
+                            decoded_data = raw_data.decode(encoding).strip()  
+                            break  
+                        except UnicodeDecodeError:  
+                            continue  
+                    
+                    if not decoded_data:  
+                        self.logger.warning(f"Cannot decode data: {raw_data}")  
+                        continue  
+                    
+                    # Proses data  
+                    distances = self.process_uwb_data(decoded_data)  
+                    
+                    if distances:  
+                        self.logger.info(f"Distances: {distances}")  
+                    
+                    time.sleep(0.1)  
                 
-                while True:  
-                    if ser.in_waiting > 0:  
-                        data = ser.readline().decode("utf-8").strip()  
-                        result = self.process_uwb_data(data)  
-                        
-                        if result:  
-                            self.logger.info(  
-                                f"A0: {result['distances'][0]:.2f} cm | "  
-                                f"A1: {result['distances'][1]:.2f} cm | "  
-                                f"A2: {result['distances'][2]:.2f} cm | "  
-                                f"Distance: {result['distance']:.2f} cm | "  
-                                f"Angle: {result['angle']:.2f}°"  
-                            )  
-                        
-                        time.sleep(0.1)  # Menghindari pembacaan berlebihan  
+                except Exception as e:  
+                    self.logger.error(f"Error in reading cycle: {e}")  
+                    time.sleep(1)  
         
         except serial.SerialException as e:  
             self.logger.error(f"Serial connection error: {e}")  
-        
+        finally:  
+            if 'ser' in locals():  
+                ser.close()  
+
 def main():  
     uwb_tracker = UWBPositioning()  
     uwb_tracker.start_uwb_reading()  
