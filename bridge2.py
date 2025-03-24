@@ -3,6 +3,7 @@ import socket
 import json
 import time
 import math
+import serial
 
 # Configuration
 ROBOT_IP = '192.168.101.113'  # Replace with the IP address of your robot's Raspberry Pi
@@ -47,12 +48,36 @@ def main():
         print(f"Connecting to {ROBOT_IP}:{PORT}...")
         client_socket.connect((ROBOT_IP, PORT))
         print("Connected!")
+
+        port = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
+        baudrate = 115200
+        timeout = 1
         
         while True:
+            ser = serial.Serial(port, baudrate, timeout=timeout)
+            print(f"Connected to {port} at {baudrate} baud.")
             # Replace this with your actual UWB sensor readings
-            A0 = float(input("Enter A0 distance (cm): "))
-            A1 = float(input("Enter A1 distance (cm): "))
-            A2 = float(input("Enter A2 distance (cm): "))
+            while True:
+                if ser.in_waiting > 0:
+                    data = ser.readline().decode("utf-8").strip()
+                    if data.startswith("$KT0"):
+                        try:
+                            parts = data.split(",")
+                            if len(parts) >= 4:
+                                # Parsing Data Jarak
+                                raw_values = parts[1:4]
+                                processed_values = []
+                                for i, value in enumerate(raw_values):
+                                    if value.lower() == "null":
+                                        processed_values.append(0.0)
+                                    else:
+                                        processed_values.append(float(value))
+                                A0, A1, A2 = processed_values
+                            print(
+                                f"\nA0 = {A0*100:.2f} cm | A1 = {A1*100:.2f} cm | A2 = {A2*100:.2f} cm"
+                            )
+                    else:
+                        print("Error: Data tidak lengkap)
             
             # Send the UWB data to the robot
             send_uwb_data(A0, A1, A2)
