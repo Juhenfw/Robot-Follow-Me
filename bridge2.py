@@ -1,9 +1,10 @@
 import socket
 import math
 import ddsm115 as motor
+from collections import deque
 
 # Konfigurasi UDP (Menerima dari Raspberry Pi 2)
-UDP_IP = "0.0.0.0"  # Dengarkan semua IP
+UDP_IP = "0.0.0.0"
 UDP_PORT = 5005
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((UDP_IP, UDP_PORT))
@@ -25,6 +26,22 @@ A1_POSITION = (-20, 0)  # Kiri belakang
 A2_POSITION = (20, 0)   # Kanan belakang
 A3_POSITION = (0, -30)  # Tengah belakang
 
+# Koreksi bias dari hasil kalibrasi manual
+bias_A1 = 15
+bias_A2 = 10
+bias_A3 = 8
+
+def correct_bias(distance, bias):
+    return max(0, distance - bias)
+
+# Buffer untuk Moving Average (Filter Noise)
+buffer_size = 5
+jarak_buffer = deque(maxlen=buffer_size)
+
+def filter_data(jarak_baru):
+    jarak_buffer.append(jarak_baru)
+    return sum(jarak_buffer) / len(jarak_buffer)
+
 # Fungsi Hitung Jarak & Sudut
 def hitung_jarak_sudut(x, y):
     jarak = math.sqrt(x**2 + y**2)
@@ -33,21 +50,26 @@ def hitung_jarak_sudut(x, y):
 
 # Fungsi Hitung Jarak dari Setiap Anchor ke T0
 def hitung_jarak_anchor(x_t0, y_t0):
-    jarak_a1 = math.sqrt((x_t0 - A1_POSITION[0])**2 + (y_t0 - A1_POSITION[1])**2)
-    jarak_a2 = math.sqrt((x_t0 - A2_POSITION[0])**2 + (y_t0 - A2_POSITION[1])**2)
-    jarak_a3 = math.sqrt((x_t0 - A3_POSITION[0])**2 + (y_t0 - A3_POSITION[1])**2)
+    jarak_a1 = correct_bias(math.sqrt((x_t0 - A1_POSITION[0])**2 + (y_t0 - A1_POSITION[1])**2), bias_A1)
+    jarak_a2 = correct_bias(math.sqrt((x_t0 - A2_POSITION[0])**2 + (y_t0 - A2_POSITION[1])**2), bias_A2)
+    jarak_a3 = correct_bias(math.sqrt((x_t0 - A3_POSITION[0])**2 + (y_t0 - A3_POSITION[1])**2), bias_A3)
     return jarak_a1, jarak_a2, jarak_a3
 
 # Loop utama
 while True:
     data, addr = sock.recvfrom(1024)  # Terima data dari Raspberry Pi 2
-    x_t0, y_t0, z_t0 = map(float, data.decode().split(","))
+    try:
+        timestamp, x_t0, y_t0, z_t0 = map(float, data.decode().split(","))
+    except ValueError:
+        print("Data tidak valid")
+        continue
 
     # Hitung jarak dari setiap anchor ke T0
     jarak_a1, jarak_a2, jarak_a3 = hitung_jarak_anchor(x_t0, y_t0)
 
     # Hitung jarak & sudut dari robot ke T0
     jarak, sudut = hitung_jarak_sudut(x_t0, y_t0)
+    jarak = filter_data(jarak)  # Gunakan Moving Average
 
     # Logika Gerakan Robot
     speed = 100
@@ -85,4 +107,3 @@ while True:
     print(f"🔹 Sudut T0 ke Robot  → {sudut:.2f}°")
     print(f"🔹 Status Motor       → {status_motor}")
     print("="*50)
-
