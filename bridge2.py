@@ -1,123 +1,78 @@
 # SENDER
-
-import socket
-import time
 import serial
-import traceback
+import math
+import socket  # Library untuk komunikasi jaringan
 
 # UDP Configuration
-UDP_IP = "192.168.1.100"  # Change to the IP address of the receiver Raspberry Pi
+UDP_IP = "192.168.1.100"  # Ganti dengan alamat IP Raspberry Pi penerima
 UDP_PORT = 5005
-print(f"Configured to send to {UDP_IP}:{UDP_PORT}")
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)  # Inisialisasi socket UDP
 
-# Create UDP socket
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+port = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
+baudrate = 115200
+timeout = 1
 
-# Serial port configuration for UWB sensor
-SERIAL_PORT = "/dev/ttyACM0"  # Change to your actual UWB sensor port
-BAUD_RATE = 115200
+L = 65  # Panjang robot
+W = 35  # Lebar robot
+anchors = {
+    "A0": (-L / 2, W / 2),  # Depan kiri
+    "A1": (-L / 2, -W / 2),  # Depan kanan
+    "A2": (L / 2, 0),  # Belakang tengah
+}
 
-def initialize_serial():
-    """Initialize and return serial connection to UWB sensor"""
-    print(f"Attempting to connect to UWB sensor on {SERIAL_PORT}...")
-    try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        print("Successfully connected to UWB sensor!")
-        return ser
-    except serial.SerialException as e:
-        print(f"Failed to connect to UWB sensor: {e}")
-        return None
+def calculate_tag_position(distances):
+    weights = []
+    x_tag, y_tag = 0, 0
+    for i, (anchor, dist) in enumerate(zip(anchors.values(), distances)):
+        x, y = anchor
+        weight = 1 / dist if dist > 0 else 0
+        weights.append(weight)
+        x_tag += x * weight
+        y_tag += y * weight
+    total_weight = sum(weights)
+    if total_weight > 0:
+        x_tag /= total_weight
+        y_tag /= total_weight
+    return x_tag, y_tag
 
-def parse_position_data(data_line):
-    """Parse position data from UWB sensor output"""
-    try:
-        # Modify this parser according to your UWB sensor's actual data format
-        # Example format: "POS: x=1.23, y=4.56, z=7.89"
-        if "POS:" in data_line:
-            parts = data_line.split("=")
-            x = float(parts[1].split(",")[0])
-            y = float(parts[2].split(",")[0])
-            z = float(parts[3])
-            return (x, y, z)
-    except Exception as e:
-        print(f"Error parsing position data: {e}")
-    return None
-
-# Main program
-print("UWB Data Sender Starting...")
-serial_reconnect_attempts = 0
-MAX_RECONNECT_ATTEMPTS = 10
+def calculate_distance_and_angle(x_tag, y_tag):
+    distance = math.sqrt(x_tag**2 + y_tag**2)
+    angle = math.degrees(math.atan2(y_tag, x_tag))
+    return distance, angle
 
 try:
-    ser = initialize_serial()
-    
+    ser = serial.Serial(port, baudrate, timeout=timeout)
     while True:
-        # Check if serial is connected
-        if ser is None or not ser.is_open:
-            serial_reconnect_attempts += 1
-            print(f"Serial not connected. Attempt {serial_reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS}")
-            
-            if serial_reconnect_attempts > MAX_RECONNECT_ATTEMPTS:
-                print("Max reconnection attempts reached. Waiting 30 seconds before retrying...")
-                time.sleep(30)
-                serial_reconnect_attempts = 0
-                
-            ser = initialize_serial()
-            time.sleep(1)
-            continue
-            
-        # Reset counter when connected
-        serial_reconnect_attempts = 0
-            
-        try:
-            # Read data from UWB sensor
-            if ser.in_waiting > 0:
-                data_line = ser.readline().decode("utf-8").strip()
-                print(f"Raw data: {data_line}")
-                
-                position_data = parse_position_data(data_line)
-                
-                if position_data:
-                    x, y, z = position_data
-                    # Add timestamp for data freshness validation
-                    timestamp = time.time()
-                    # Format: timestamp, x, y, z
-                    message = f"{timestamp},{x},{y},{z}"
-                    
-                    # Send data via UDP
-                    try:
-                        sock.sendto(message.encode(), (UDP_IP, UDP_PORT))
-                        print(f"Sent position: X={x:.2f}, Y={y:.2f}, Z={z:.2f}")
-                    except socket.error as e:
-                        print(f"UDP send error: {e}")
+        if ser.in_waiting > 0:
+            data = ser.readline().decode("utf-8").strip()
+            if data.startswith("$KT0"):
+                try:
+                    parts = data.split(",")
+                    if len(parts) >= 4:
+                        raw_values = parts[1:4]
+                        processed_values = []
+                        for value in raw_values:
+                            if value.lower() == "null":
+                                processed_values.append(0.0)
+                            else:
+                                processed_values.append(float(value))
+                        A0, A1, A2 = [val * 100 for val in processed_values]
+                        x_tag, y_tag = calculate_tag_position([A0, A1, A2])
+                        distance, angle = calculate_distance_and_angle(x_tag, y_tag)
                         
-        except serial.SerialException as e:
-            print(f"Serial error: {e}")
-            # Close the serial connection to force reconnect in next iteration
-            try:
-                ser.close()
-                print("Disconnected from serial port")
-            except:
-                pass
-            ser = None
-            time.sleep(1)
-                
-        except Exception as e:
-            print(f"Unexpected error: {e}")
-            traceback.print_exc()
-            time.sleep(1)
-            
-        # Small delay to prevent CPU overload
-        time.sleep(0.01)
-            
-except KeyboardInterrupt:
-    print("\nProgram stopped by user")
-    # Clean shutdown
-    if 'ser' in locals() and ser is not None and ser.is_open:
-        ser.close()
-    sock.close()
-except Exception as e:
-    print(f"Fatal error: {e}")
-    traceback.print_exc()
+                        output = f"A0={A0:.2f},A1={A1:.2f},A2={A2:.2f},DIST={distance:.2f},ANGLE={angle:.2f}"
+                        # Kirim data ke Raspberry Pi lain menggunakan UDP
+                        sock.sendto(output.encode(), (UDP_IP, UDP_PORT))
+                        
+                        print(f"A0 = {A0:.2f} centimeter | A1 = {A1:.2f} centimeter | A2 = {A2:.2f} centimeter | T0 to Robot = {distance:.2f} cm | Sudut = {angle:.2f}°")
+                    else:
+                        print("Error: Data tidak lengkap.")
+                except ValueError as e:
+                    print(f"Error processing data: {e}")
+except serial.SerialException as e:
+    print(f"Error: {e}")
 finally:
-    print("Sender script terminated")
+    if "ser" in locals() and ser.is_open:
+        ser.close()
+        print("Serial connection closed.")
+    sock.close()
