@@ -1,170 +1,292 @@
-import serial  
-import math  
 import numpy as np  
+import math  
+import serial  
+import time  
 from scipy.optimize import minimize  
-import logging  
 
-class UWBPositioning:  
-    def __init__(self, port="/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",   
-                 baudrate=115200,   
-                 timeout=1):  
-        # Konfigurasi robot  
-        self.L = 65  # Panjang robot  
-        self.W = 35  # Lebar robot  
-
-        # Konfigurasi anchor  
-        self.anchors = {  
-            "A0": (-self.L / 2, self.W / 2),   # Depan kiri  
-            "A1": (-self.L / 2, -self.W / 2),  # Depan kanan  
-            "A2": (self.L / 2, 0),             # Belakang tengah  
+class UWBTracker:  
+    def __init__(self, fixed_anchor_positions, initial_bias=None):  
+        """  
+        Inisialisasi tracker UWB dengan posisi anchor dan manajemen bias  
+        
+        Args:  
+        fixed_anchor_positions: Koordinat anchor A1, A2 yang sudah diketahui  
+        initial_bias: Bias awal untuk setiap anchor  
+        """  
+        # Posisi anchor tetap  
+        self.A1_pos = np.array(fixed_anchor_positions['A1'])  
+        self.A2_pos = np.array(fixed_anchor_positions['A2'])  
+        
+        # Sudut tetap antara anchor  
+        self.fixed_angle = math.radians(60)  
+        
+        # Manajemen bias  
+        self.bias = initial_bias or {  
+            'A0': 0,  # Bias untuk A0  
+            'A1': 0,  # Bias untuk A1  
+            'A2': 0   # Bias untuk A2  
         }  
-
-        # Konfigurasi serial  
-        self.port = port  
-        self.baudrate = baudrate  
-        self.timeout = timeout  
-
-        # Setup logging  
-        logging.basicConfig(level=logging.INFO,   
-                            format='%(asctime)s - %(levelname)s: %(message)s')  
-        self.logger = logging.getLogger(__name__)  
-
-    def method_weighted_centroid(self, distances):  
+        
+        # Parameter kalibrasi tambahan  
+        self.scale_factor = {  
+            'A0': 1.0,  
+            'A1': 1.0,  
+            'A2': 1.0  
+        }  
+    
+    def apply_bias_correction(self, distances):  
         """  
-        Metode 1: Weighted Centroid  
+        Koreksi bias dan scaling pada pengukuran jarak  
+        
+        Args:  
+        distances: Dictionary jarak mentah dari setiap anchor  
+        
+        Returns:  
+        Dictionary jarak terkoreksi dalam cm  
         """  
-        weights = []  
-        x_tag, y_tag = 0, 0  
-        total_weight = 0  
-
-        for anchor, dist in zip(self.anchors.values(), distances):  
-            x, y = anchor  
-            weight = 1 / (dist + 0.001)  # Hindari pembagian nol  
-            weights.append(weight)  
-            x_tag += x * weight  
-            y_tag += y * weight  
-            total_weight += weight  
-
-        x_tag /= total_weight  
-        y_tag /= total_weight  
-
-        return x_tag, y_tag  
-
-    def method_trilateration(self, distances):  
+        corrected_distances = {  
+            'A0': max((distances['A0'] * 100 * self.scale_factor['A0']) - self.bias['A0'], 0),  
+            'A1': max((distances['A1'] * 100 * self.scale_factor['A1']) - self.bias['A1'], 0),  
+            'A2': max((distances['A2'] * 100 * self.scale_factor['A2']) - self.bias['A2'], 0)  
+        }  
+        return corrected_distances  
+    
+    def trilateration_cost(self, target_pos, corrected_distances, anchor_positions):  
         """  
-        Metode 2: Trilaterasi menggunakan optimasi  
+        Fungsi biaya untuk estimasi posisi target dengan pertimbangan geometri  
+        
+        Args:  
+        target_pos: Posisi target yang dicoba  
+        corrected_distances: Jarak terkoreksi dari setiap anchor  
+        anchor_positions: Posisi anchor  
+        
+        Returns:  
+        Total error kuadrat  
         """  
-        def objective_function(pos):  
-            return sum(  
-                (np.linalg.norm(pos - np.array(anchor)) - dist)**2   
-                for anchor, dist in zip(list(self.anchors.values()), distances)  
+        # Hitung jarak dari target ke setiap anchor  
+        calculated_distances = [  
+            np.linalg.norm(target_pos - anchor_positions['A1']),  
+            np.linalg.norm(target_pos - anchor_positions['A2']),  
+            np.linalg.norm(target_pos - anchor_positions['A0'])  
+        ]  
+        
+        # Hitung error kuadrat dengan bobot  
+        distance_errors = [  
+            ((calc - measured) ** 2)   
+            for calc, measured in zip(  
+                calculated_distances,   
+                [corrected_distances['A1'], corrected_distances['A2'], corrected_distances['A0']]  
             )  
-
-        initial_guess = [0, 0]  
-        result = minimize(objective_function, initial_guess, method='Nelder-Mead')  
+        ]  
         
-        return result.x  
-
-    def method_angle_calculation(self, x_tag, y_tag):  
+        return np.sum(distance_errors)  
+    
+    def estimate_target_position(self, distances, anchor_positions):  
         """  
-        Metode perhitungan sudut dengan variasi  
+        Estimasi posisi target menggunakan optimasi trilateration  
+        
+        Args:  
+        distances: Dictionary jarak dari setiap anchor  
+        anchor_positions: Posisi anchor  
+        
+        Returns:  
+        Estimasi posisi target dan informasi diagnostik  
         """  
-        methods = {  
-            'atan2': math.degrees(math.atan2(y_tag, x_tag)),  
-            'law_of_cosines': self._angle_law_of_cosines(x_tag, y_tag),  
-            'dot_product': self._angle_dot_product(x_tag, y_tag)  
+        # Terapkan koreksi bias  
+        corrected_distances = self.apply_bias_correction(distances)  
+        
+        # Persiapan initial guess  
+        initial_guess = np.mean([  
+            anchor_positions['A1'],   
+            anchor_positions['A2'],   
+            anchor_positions['A0']  
+        ], axis=0)  
+        
+        # Optimasi untuk menemukan posisi target  
+        result = minimize(  
+            self.trilateration_cost,   
+            initial_guess,   
+            args=(corrected_distances, anchor_positions),  
+            method='Nelder-Mead',  
+            options={'maxiter': 100}  
+        )  
+        
+        # Simpan informasi diagnostik  
+        diagnostics = {  
+            'raw_distances': distances,  
+            'corrected_distances': corrected_distances,  
+            'optimization_success': result.success,  
+            'optimization_message': result.message  
         }  
-        return methods  
-
-    def _angle_law_of_cosines(self, x_tag, y_tag):  
-        """  
-        Sudut menggunakan hukum kosinus  
-        """  
-        distance = math.sqrt(x_tag**2 + y_tag**2)  
-        if distance == 0:  
-            return 0  
-        cos_theta = x_tag / distance  
-        return math.degrees(math.acos(cos_theta))  
-
-    def _angle_dot_product(self, x_tag, y_tag):  
-        """  
-        Sudut menggunakan dot product  
-        """  
-        reference_vector = [1, 0]  # Vektor referensi sumbu x  
-        current_vector = [x_tag, y_tag]  
         
-        dot_product = np.dot(reference_vector, current_vector)  
-        magnitude_product = np.linalg.norm(reference_vector) * np.linalg.norm(current_vector)  
-        
-        cos_theta = dot_product / magnitude_product  
-        return math.degrees(math.acos(cos_theta))  
-
-    def process_uwb_data(self, data):  
+        return result.x, diagnostics  
+    
+    def calculate_angle(self, a, b, c):  
         """  
-        Proses data UWB dengan berbagai metode  
+        Hitung sudut menggunakan hukum kosinus  
+        
+        Args:  
+        a, b, c: Panjang sisi-sisi segitiga  
+        
+        Returns:  
+        Sudut dalam derajat  
         """  
         try:  
-            parts = data.split(",")  
-            if len(parts) < 4 or not parts[0].startswith("$KT0"):  
-                self.logger.warning("Invalid data format")  
-                return None  
-
-            # Proses jarak  
-            raw_values = parts[1:4]  
-            processed_values = [  
-                0.0 if value.lower() == "null" else float(value)   
-                for value in raw_values  
-            ]  
+            # Pastikan tidak ada pembagian dengan nol  
+            cos_angle = (a**2 + b**2 - c**2) / (2 * a * b)  
             
-            # Konversi ke cm  
-            distances = [val * 100 for val in processed_values]  
-
-            # Metode weighted centroid  
-            x_tag, y_tag = self.method_weighted_centroid(distances)  
-
-            # Kalkulasi jarak dan sudut  
-            distance = math.sqrt(x_tag**2 + y_tag**2)  
-            angle_methods = self.method_angle_calculation(x_tag, y_tag)  
-
-            return {  
-                "raw_distances": distances,  
-                "position": (x_tag, y_tag),  
-                "distance": distance,  
-                "angles": angle_methods  
-            }  
-
+            # Pastikan nilai cosinus valid  
+            cos_angle = max(min(cos_angle, 1), -1)  
+            
+            # Hitung sudut dalam derajat  
+            angle = math.degrees(math.acos(cos_angle))  
+            
+            return angle  
         except Exception as e:  
-            self.logger.error(f"Error processing data: {e}")  
+            print(f"Error calculating angle: {e}")  
             return None  
+    
+    def calculate_robot_angle(self, target_pos, reference_pos):  
+        """  
+        Hitung sudut robot untuk mengejar target  
+        
+        Args:  
+        target_pos: Posisi target  
+        reference_pos: Posisi referensi (biasanya posisi A0)  
+        
+        Returns:  
+        Sudut robot dalam derajat  
+        """  
+        # Vektor dari referensi ke target  
+        vector_to_target = target_pos - reference_pos  
+        
+        # Gunakan arctangent2 untuk sudut absolut  
+        angle = math.atan2(vector_to_target[1], vector_to_target[0])  
+        
+        return math.degrees(angle)  
+    
+    def print_tracking_info(self, corrected_distances, robot_angle=None, additional_angle=None):  
+        """  
+        Cetak informasi tracking dalam format yang diinginkan  
+        
+        Args:  
+        corrected_distances: Jarak terkoreksi dari setiap anchor  
+        robot_angle: Sudut robot (opsional)  
+        additional_angle: Sudut tambahan (opsional)  
+        """  
+        print(  
+            f"\nA0 = {corrected_distances['A0']:.2f} cm | "  
+            f"A1 = {corrected_distances['A1']:.2f} cm | "  
+            f"A2 = {corrected_distances['A2']:.2f} cm"  
+        )  
+        
+        # Tambahkan output sudut jika tersedia  
+        if robot_angle is not None:  
+            print(f"Sudut Robot: {robot_angle:.2f} derajat")  
+        
+        if additional_angle is not None:  
+            print(f"Sudut Tambahan: {additional_angle:.2f} derajat")  
 
-    def start_reading(self):  
-        """  
-        Membaca data serial  
-        """  
-        try:  
-            with serial.Serial(self.port, self.baudrate, timeout=self.timeout) as ser:  
-                self.logger.info("Serial connection established")  
+def main_uwb_tracking():  
+    # Inisialisasi port serial UWB  
+    try:  
+        ser = serial.Serial(  
+            port="/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",  
+            baudrate=115200,  
+            timeout=1  
+        )  
+    except serial.SerialException as e:  
+        print(f"Error membuka port serial: {e}")  
+        return  
+    
+    # Inisialisasi tracker dengan posisi anchor  
+    tracker = UWBTracker({  
+        'A1': [0, 1],    # Koordinat A1   
+        'A2': [1, 0]     # Koordinat A2  
+    })  
+    
+    try:  
+        while True:  
+            if ser.in_waiting > 0:  
+                # Baca data dari serial  
+                data = ser.readline().decode("utf-8").strip()  
                 
-                while True:  
-                    if ser.in_waiting > 0:  
-                        data = ser.readline().decode("utf-8").strip()  
-                        result = self.process_uwb_data(data)  
+                # Pastikan data valid  
+                if data.startswith("$KT0"):  
+                    try:  
+                        # Parse data UWB  
+                        parts = data.split(",")  
+                        if len(parts) >= 4:  
+                            # Konversi data ke float  
+                            raw_values = [  
+                                float(parts[1]) if parts[1].lower() != "null" else 0.0,  
+                                float(parts[2]) if parts[2].lower() != "null" else 0.0,  
+                                float(parts[3]) if parts[3].lower() != "null" else 0.0  
+                            ]  
+                            
+                            # Simulasi posisi anchor bergerak  
+                            anchor_positions = {  
+                                'A0': np.array([0.5, 0.5]),  # Posisi A0 yang bergerak  
+                                'A1': np.array([0, 1]),      # Posisi A1 tetap  
+                                'A2': np.array([1, 0])       # Posisi A2 tetap  
+                            }  
+                            
+                            # Siapkan data jarak  
+                            uwb_data = {  
+                                'A0': raw_values[0],  
+                                'A1': raw_values[1],  
+                                'A2': raw_values[2]  
+                            }  
+                            
+                            # Koreksi bias  
+                            corrected_distances = tracker.apply_bias_correction(uwb_data)  
+                            
+                            # Estimasi posisi target  
+                            target_pos, diagnostics = tracker.estimate_target_position(  
+                                uwb_data,   
+                                anchor_positions  
+                            )  
+                            
+                            # Hitung sudut robot  
+                            robot_angle = tracker.calculate_robot_angle(  
+                                target_pos,   
+                                anchor_positions['A0']  
+                            )  
+                            
+                            # Hitung sudut tambahan menggunakan hukum kosinus  
+                            additional_angle = tracker.calculate_angle(  
+                                corrected_distances['A0'],  # a  
+                                corrected_distances['A1'],  # b  
+                                corrected_distances['A2']   # c  
+                            )  
+                            
+                            # Cetak informasi tracking  
+                            tracker.print_tracking_info(  
+                                corrected_distances,   
+                                robot_angle,  
+                                additional_angle  
+                            )  
+                            
+                            # Cetak informasi tambahan  
+                            print("\nDiagnostik:")  
+                            print("Estimasi Posisi Target:", target_pos)  
+                            print("Status Optimasi:", diagnostics['optimization_success'])  
                         
-                        if result:  
-                            print("\n--- UWB Position Data ---")  
-                            print(f"Raw Distances: {result['raw_distances']}")  
-                            print(f"Position (x,y): {result['position']}")  
-                            print(f"Distance: {result['distance']:.2f} cm")  
-                            print("Angle Methods:")  
-                            for method, angle in result['angles'].items():  
-                                print(f"- {method}: {angle:.2f}°")  
+                        # Jeda untuk mencegah overload  
+                        time.sleep(0.5)  
+                    
+                    except Exception as e:  
+                        print(f"Error memproses data: {e}")  
+    
+    except KeyboardInterrupt:  
+        print("Tracking dihentikan oleh pengguna.")  
+    
+    finally:  
+        # Tutup koneksi serial  
+        if 'ser' in locals() and ser.is_open:  
+            ser.close()  
+            print("Koneksi serial ditutup.")  
 
-        except serial.SerialException as e:  
-            self.logger.error(f"Serial connection error: {e}")  
-
-def main():  
-    uwb_tracker = UWBPositioning()  
-    uwb_tracker.start_reading()  
-
+# Jalankan tracking UWB  
 if __name__ == "__main__":  
-    main()
+    main_uwb_tracking()  
