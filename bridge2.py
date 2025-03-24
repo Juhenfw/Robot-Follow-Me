@@ -1,108 +1,66 @@
-#!/usr/bin/env python3
 import socket
-import json
-import time
-import math
 import serial
+import time
 
-# Configuration
-ROBOT_IP = '192.168.101.113'  # Replace with the IP address of your robot's Raspberry Pi
-PORT = 65432
-SEND_INTERVAL = 0.1  # seconds between transmissions
-
-# Create a TCP/IP socket
-client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-def send_uwb_data(A0, A1, A2):
-    """
-    Send UWB anchor distances to the robot
+def main_uwb_transmitter():
+    # Inisialisasi port serial UWB
+    try:
+        ser = serial.Serial(
+            port="/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",  # Ganti dengan port sesuai Raspberry Pi 1
+            baudrate=115200,
+            timeout=1
+        )
+    except serial.SerialException as e:
+        print(f"Error membuka port serial: {e}")
+        return
     
-    Args:
-        A0, A1, A2: Distances to the respective anchors in centimeters
-    """
+    # Inisialisasi socket
+    UDP_IP = "192.168.1.2"  # IP Raspberry Pi 2
+    UDP_PORT = 5005         # Port untuk komunikasi
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    
     try:
-        # Create data packet with raw anchor distances
-        data = {
-            "A0": round(A0, 2),
-            "A1": round(A1, 2),
-            "A2": round(A2, 2),
-            "timestamp": time.time()
-        }
-        
-        # Convert to JSON string with newline delimiter
-        json_data = json.dumps(data) + "\n"
-        
-        # Send data
-        client_socket.sendall(json_data.encode('utf-8'))
-        
-        # Display locally what was sent
-        print(f"A0 = {A0:.2f} cm | A1 = {A1:.2f} cm | A2 = {A2:.2f} cm")
-        
-    except Exception as e:
-        print(f"Error sending data: {e}")
-        raise
-
-def main():
-    try:
-        # Connect to the robot's Raspberry Pi
-        print(f"Connecting to {ROBOT_IP}:{PORT}...")
-        client_socket.connect((ROBOT_IP, PORT))
-        print("Connected!")
-        
-        port = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
-        baudrate = 115200
-        timeout = 1
-        
-        ser = serial.Serial(port, baudrate, timeout=timeout)
-        print(f"Connected to {port} at {baudrate} baud.")
-        
         while True:
             if ser.in_waiting > 0:
+                # Baca data dari serial
                 data = ser.readline().decode("utf-8").strip()
+                
+                # Pastikan data valid
                 if data.startswith("$KT0"):
                     try:
+                        # Parse data UWB
                         parts = data.split(",")
                         if len(parts) >= 4:
-                            # Parsing Data Jarak
-                            raw_values = parts[1:4]
-                            processed_values = []
+                            # Konversi data ke float
+                            raw_values = [
+                                float(parts[1]) if parts[1].lower() != "null" else 0.0,
+                                float(parts[2]) if parts[2].lower() != "null" else 0.0,
+                                float(parts[3]) if parts[3].lower() != "null" else 0.0
+                            ]
                             
-                            for i, value in enumerate(raw_values):
-                                if value.lower() == "null":
-                                    processed_values.append(0.0)
-                                else:
-                                    processed_values.append(float(value))
-                            
-                            A0, A1, A2 = processed_values
-                            
-                            # Convert from meters to centimeters
-                            A0 = A0 * 100
-                            A1 = A1 * 100
-                            A2 = A2 * 100
-                            
-                            print(f"\nA0 = {A0:.2f} cm | A1 = {A1:.2f} cm | A2 = {A2:.2f} cm")
-                            
-                            # Send the UWB data to the robot
-                            send_uwb_data(A0, A1, A2)
-                        else:
-                            print("Error: Data tidak lengkap")
-                    except Exception as e:
-                        print(f"Error parsing data: {e}")
+                            # Kirim data ke Raspberry Pi 2
+                            uwb_data = ",".join([str(val) for val in raw_values])
+                            sock.sendto(uwb_data.encode(), (UDP_IP, UDP_PORT))
+                            print(f"Data terkirim: {uwb_data}")
                         
-            # Optional: add a delay between readings
-            time.sleep(0.01)  # Small delay to prevent CPU hogging
-            
+                        # Jeda untuk mencegah overload
+                        time.sleep(0.5)
+                    
+                    except Exception as e:
+                        print(f"Error memproses data: {e}")
+    
     except KeyboardInterrupt:
-        print("\nStopping sender...")
-    except ConnectionRefusedError:
-        print(f"Connection refused. Is the receiver running at {ROBOT_IP}:{PORT}?")
-    except Exception as e:
-        print(f"Error: {e}")
+        print("Transmitter dihentikan oleh pengguna.")
+    
     finally:
-        client_socket.close()
+        # Tutup koneksi serial
         if 'ser' in locals() and ser.is_open:
             ser.close()
-        print("Sender closed")
+            print("Koneksi serial ditutup.")
+
+        # Tutup socket
+        sock.close()
+        print("Koneksi socket ditutup.")
 
 if __name__ == "__main__":
-    main()
+    main_uwb_transmitter()
