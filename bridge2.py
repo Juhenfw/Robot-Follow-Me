@@ -1,58 +1,80 @@
-import serial
+# SENDER
+
 import socket
 import time
-import json
-
-# Serial Configuration
-SERIAL_PORT = '/dev/ttyACM0'  # Change to match your device
-BAUDRATE = 115200
-TIMEOUT = 1
+import serial
+import traceback
 
 # UDP Configuration
-UDP_IP = "192.168.1.100"  # IP address of the receiver (robot)
+UDP_IP = "192.168.1.100"  # Change to the IP address of the receiver Raspberry Pi
 UDP_PORT = 5005
+print(f"Configured to send to {UDP_IP}:{UDP_PORT}")
+
+# Create UDP socket
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+# Serial port configuration for UWB sensor
+SERIAL_PORT = "/dev/ttyACM0"  # Change to your actual UWB sensor port
+BAUD_RATE = 115200
+
 def initialize_serial():
-    """Initialize and return serial connection with retry logic"""
-    max_attempts = 5
-    for attempt in range(max_attempts):
-        try:
-            ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=TIMEOUT)
-            print(f"Connected to {SERIAL_PORT}")
-            return ser
-        except serial.SerialException as e:
-            print(f"Attempt {attempt+1}/{max_attempts}: Failed to connect to {SERIAL_PORT}: {e}")
-            if attempt < max_attempts - 1:
-                print(f"Retrying in 2 seconds...")
-                time.sleep(2)
-    
-    raise Exception(f"Failed to connect to {SERIAL_PORT} after {max_attempts} attempts")
+    """Initialize and return serial connection to UWB sensor"""
+    print(f"Attempting to connect to UWB sensor on {SERIAL_PORT}...")
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+        print("Successfully connected to UWB sensor!")
+        return ser
+    except serial.SerialException as e:
+        print(f"Failed to connect to UWB sensor: {e}")
+        return None
 
 def parse_position_data(data_line):
-    """Parse position data from UWB device"""
+    """Parse position data from UWB sensor output"""
     try:
-        # Example data format: "POS,T0,1234.56,789.01,23.45"
-        # Adjust parsing according to your actual data format
-        parts = data_line.split(',')
-        if parts[0] == "POS" and parts[1] == "T0":
-            x = float(parts[2])
-            y = float(parts[3])
-            z = float(parts[4])
-            return x, y, z
-        return None
-    except (IndexError, ValueError) as e:
-        print(f"Error parsing data: {e}")
-        return None
+        # Modify this parser according to your UWB sensor's actual data format
+        # Example format: "POS: x=1.23, y=4.56, z=7.89"
+        if "POS:" in data_line:
+            parts = data_line.split("=")
+            x = float(parts[1].split(",")[0])
+            y = float(parts[2].split(",")[0])
+            z = float(parts[3])
+            return (x, y, z)
+    except Exception as e:
+        print(f"Error parsing position data: {e}")
+    return None
 
-# Main execution
+# Main program
+print("UWB Data Sender Starting...")
+serial_reconnect_attempts = 0
+MAX_RECONNECT_ATTEMPTS = 10
+
 try:
     ser = initialize_serial()
     
     while True:
+        # Check if serial is connected
+        if ser is None or not ser.is_open:
+            serial_reconnect_attempts += 1
+            print(f"Serial not connected. Attempt {serial_reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS}")
+            
+            if serial_reconnect_attempts > MAX_RECONNECT_ATTEMPTS:
+                print("Max reconnection attempts reached. Waiting 30 seconds before retrying...")
+                time.sleep(30)
+                serial_reconnect_attempts = 0
+                
+            ser = initialize_serial()
+            time.sleep(1)
+            continue
+            
+        # Reset counter when connected
+        serial_reconnect_attempts = 0
+            
         try:
+            # Read data from UWB sensor
             if ser.in_waiting > 0:
                 data_line = ser.readline().decode("utf-8").strip()
+                print(f"Raw data: {data_line}")
+                
                 position_data = parse_position_data(data_line)
                 
                 if position_data:
@@ -71,26 +93,31 @@ try:
                         
         except serial.SerialException as e:
             print(f"Serial error: {e}")
-            # Try to reconnect
+            # Close the serial connection to force reconnect in next iteration
             try:
                 ser.close()
                 print("Disconnected from serial port")
-                time.sleep(1)
-                ser = initialize_serial()
-            except Exception as e:
-                print(f"Failed to reconnect: {e}")
-                time.sleep(5)
+            except:
+                pass
+            ser = None
+            time.sleep(1)
                 
         except Exception as e:
             print(f"Unexpected error: {e}")
+            traceback.print_exc()
             time.sleep(1)
             
         # Small delay to prevent CPU overload
         time.sleep(0.01)
             
 except KeyboardInterrupt:
-    print("Program stopped by user")
+    print("\nProgram stopped by user")
     # Clean shutdown
-    if 'ser' in locals() and ser.is_open:
+    if 'ser' in locals() and ser is not None and ser.is_open:
         ser.close()
     sock.close()
+except Exception as e:
+    print(f"Fatal error: {e}")
+    traceback.print_exc()
+finally:
+    print("Sender script terminated")
