@@ -1,215 +1,63 @@
-#!/usr/bin/env python3
+import socket
+import math
 
-import serial
-import time
-import json
-import signal
-import sys
-from threading import Thread
+# Alamat IP Raspberry Pi yang berada di robot
+IP_ROBOT = '192.168.1.100'  # Ganti dengan alamat IP Raspberry Pi robot
+PORT = 65432  # Port yang sama dengan server
 
-class HaoruTechRTLS:
-    def __init__(self, port="/dev/ttyUSB0", baudrate=115200):
-        """
-        Initialize connection to HR-RTLS1 device
-        
-        Args:
-            port: Serial port where the device is connected
-            baudrate: Communication speed (check manual for correct setting)
-        """
-        self.ser = None
-        self.port = port
-        self.baudrate = baudrate
-        self.running = False
-        self.data_thread = None
-        
-    def connect(self):
-        """Establish connection to the HR-RTLS1 device"""
-        try:
-            self.ser = serial.Serial(
-                port=self.port,
-                baudrate=self.baudrate,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                bytesize=serial.EIGHTBITS,
-                timeout=1
-            )
-            
-            if self.ser.isOpen():
-                print(f"Connected to HR-RTLS1 on {self.port}")
-                return True
-            else:
-                print(f"Failed to open connection on {self.port}")
-                return False
-                
-        except Exception as e:
-            print(f"Connection error: {str(e)}")
-            return False
-    
-    def disconnect(self):
-        """Close connection to device"""
-        if self.ser and self.ser.isOpen():
-            self.ser.close()
-            print("Disconnected from HR-RTLS1")
-    
-    def send_command(self, command):
-        """
-        Send command to the device
-        
-        Args:
-            command: Command string according to HR-RTLS1 protocol
-        """
-        if not self.ser or not self.ser.isOpen():
-            print("Error: Device not connected")
-            return False
-            
-        try:
-            # Add termination character if needed (check manual)
-            if not command.endswith('\r\n'):
-                command += '\r\n'
-                
-            self.ser.write(command.encode())
-            return True
-        except Exception as e:
-            print(f"Error sending command: {str(e)}")
-            return False
-    
-    def read_response(self, timeout=1.0):
-        """
-        Read response from the device
-        
-        Args:
-            timeout: Maximum time to wait for response in seconds
-        
-        Returns:
-            Response string or None if timeout
-        """
-        if not self.ser or not self.ser.isOpen():
-            print("Error: Device not connected")
-            return None
-            
-        try:
-            # Set timeout for this read operation
-            self.ser.timeout = timeout
-            
-            # Read until encounter newline
-            response = self.ser.readline().decode().strip()
-            return response
-        except Exception as e:
-            print(f"Error reading response: {str(e)}")
-            return None
-    
-    def configure_system(self):
-        """Configure the HR-RTLS1 system with initial settings"""
-        # Send configuration commands according to manual
-        # Example (modify based on actual commands from manual):
-        self.send_command("AT+CONFIG")
-        response = self.read_response()
-        print(f"Config response: {response}")
-        
-        # Set mode to tag or anchor as needed
-        self.send_command("AT+MODE=TAG")  # or ANCHOR
-        response = self.read_response()
-        print(f"Mode response: {response}")
-        
-        # Additional configuration commands
-        # ...
-    
-    def start_ranging(self):
-        """Start the ranging/positioning process"""
-        self.send_command("AT+START")
-        response = self.read_response()
-        print(f"Start ranging response: {response}")
-        
-        # Start background thread to continuously receive positioning data
-        self.running = True
-        self.data_thread = Thread(target=self._data_receiver)
-        self.data_thread.daemon = True
-        self.data_thread.start()
-    
-    def stop_ranging(self):
-        """Stop the ranging/positioning process"""
-        self.running = False
-        if self.data_thread:
-            self.data_thread.join(timeout=2.0)
-            
-        self.send_command("AT+STOP")
-        response = self.read_response()
-        print(f"Stop ranging response: {response}")
-    
-    def _data_receiver(self):
-        """Background thread to continuously receive positioning data"""
-        while self.running:
-            try:
-                data = self.read_response(timeout=0.1)
-                if data:
-                    self._process_data(data)
-            except Exception as e:
-                print(f"Error in data receiver: {str(e)}")
-                time.sleep(0.1)
-    
-    def _process_data(self, data):
-        """
-        Process received positioning data
-        
-        Args:
-            data: Data string received from device
-        """
-        try:
-            # Attempt to parse as JSON if the system outputs JSON format
-            # Modify according to actual data format from HR-RTLS1
-            try:
-                json_data = json.loads(data)
-                print(f"Position: x={json_data.get('x', 0):.2f}m, y={json_data.get('y', 0):.2f}m, z={json_data.get('z', 0):.2f}m")
-            except json.JSONDecodeError:
-                # If not JSON, process according to actual format
-                if data.startswith("POS:"):
-                    # Example format: "POS:1.23,4.56,0.78"
-                    parts = data.split(":")[1].split(",")
-                    if len(parts) >= 3:
-                        x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
-                        print(f"Position: x={x:.2f}m, y={y:.2f}m, z={z:.2f}m")
-                else:
-                    # Raw output
-                    print(f"Data: {data}")
-                    
-        except Exception as e:
-            print(f"Error processing data: {str(e)}")
-            print(f"Raw data: {data}")
+# Konfigurasi Anchor dan Perhitungan
+L = 65  # Panjang robot
+W = 35  # Lebar robot
+anchors = {
+    "A0": (-L / 2, W / 2),  # Depan kiri
+    "A1": (-L / 2, -W / 2),  # Depan kanan
+    "A2": (L / 2, 0),  # Belakang tengah
+}
 
-def main():
-    # Create instance of HaoruTech RTLS handler
-    rtls = HaoruTechRTLS(port="/dev/ttyUSB0", baudrate=115200)
-    
-    try:
-        # Connect to device
-        if not rtls.connect():
-            print("Failed to connect to HR-RTLS1 device")
-            return
-        
-        # Configure the system
-        rtls.configure_system()
-        
-        # Start ranging/positioning
-        rtls.start_ranging()
-        
-        # Keep main thread running
-        print("System running. Press Ctrl+C to exit.")
-        while True:
-            time.sleep(1)
-            
-    except KeyboardInterrupt:
-        print("Stopping...")
-    finally:
-        # Clean shutdown
-        rtls.stop_ranging()
-        rtls.disconnect()
-        print("System stopped")
+# Fungsi perhitungan posisi tag berdasarkan data dari UWB
+def calculate_tag_position(distances):
+    weights = []
+    x_tag, y_tag = 0, 0
 
-if __name__ == "__main__":
-    # Set up signal handler for clean exit
-    def signal_handler(sig, frame):
-        print("Ctrl+C pressed. Exiting...")
-        sys.exit(0)
-        
-    signal.signal(signal.SIGINT, signal_handler)
-    main()
+    for i, (anchor, dist) in enumerate(zip(anchors.values(), distances)):
+        x, y = anchor
+        weight = 1 / dist if dist > 0 else 0
+        weights.append(weight)
+        x_tag += x * weight
+        y_tag += y * weight
+
+    total_weight = sum(weights)
+
+    if total_weight > 0:
+        x_tag /= total_weight
+        y_tag /= total_weight
+
+    return x_tag, y_tag
+
+# Fungsi perhitungan jarak dan sudut
+def calculate_distance_and_angle(x_tag, y_tag):
+    distance = math.sqrt(x_tag**2 + y_tag**2)
+    angle = math.degrees(math.atan2(y_tag, x_tag))
+    return distance, angle
+
+try:
+    # Membuat koneksi ke server (Raspberry Pi robot)
+    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client_socket.connect((IP_ROBOT, PORT))
+    print(f"Terkoneksi dengan server {IP_ROBOT}:{PORT}")
+
+    while True:
+        # Data jarak UWB (contoh data, ganti dengan pembacaan sensor Anda)
+        distances = [1.5, 2.0, 1.8]  # Jarak dalam meter
+        x_tag, y_tag = calculate_tag_position(distances)
+        distance, angle = calculate_distance_and_angle(x_tag, y_tag)
+
+        # Buat pesan yang akan dikirim
+        message = f"Distance: {distance:.2f} cm, Angle: {angle:.2f}°"
+        client_socket.sendall(message.encode('utf-8'))
+        print(f"Data dikirim: {message}")
+
+except KeyboardInterrupt:
+    print("Pengiriman data dihentikan.")
+finally:
+    client_socket.close()
