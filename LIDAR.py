@@ -79,46 +79,165 @@ DISTANCE_FILTER_MIN = 150   # Minimum valid distance in mm
 lidar = None
 
 def initialize_lidar():
-    """Initialize the A2M12 LiDAR with proper settings."""
+    """Inisialisasi LIDAR A2M12 dengan metode yang lebih kuat untuk mengatasi 'Descriptor length mismatch'."""
     global lidar, lidar_health
     
     try:
+        # Tutup koneksi LIDAR yang mungkin ada sebelumnya
         if lidar is not None:
             try:
                 lidar.stop()
-                lidar.disconnect()
                 time.sleep(0.5)
+                lidar.disconnect()
+                time.sleep(1.0)  # Tunggu lebih lama untuk memastikan port benar-benar bebas
+            except Exception as e:
+                logger.warning(f"Error saat menutup koneksi LIDAR sebelumnya: {e}")
+                pass
+        
+        logger.info(f"Menginisialisasi LIDAR A2M12 pada {PORT_LIDAR} dengan baud rate {BAUDRATE_LIDAR}")
+        
+        # Untuk A2M12, kita perlu mencoba beberapa pendekatan berbeda
+        
+        # Pendekatan 1: Gunakan parameter timeout yang lebih panjang
+        try:
+            lidar = RPLidar(PORT_LIDAR, baudrate=BAUDRATE_LIDAR, timeout=5.0)
+            time.sleep(2.0)  # Berikan waktu lebih lama untuk handshaking
+            
+            # Verifikasi koneksi dengan mencoba mendapatkan info perangkat
+            info = lidar.get_info()
+            logger.info(f"Berhasil terhubung ke LIDAR: {info}")
+            
+            # Set health LIDAR ke connected
+            with data_lock:
+                lidar_health["connected"] = True
+                lidar_health["last_scan_time"] = time.time()
+                lidar_health["error_count"] = 0
+            
+            return True
+        except Exception as e:
+            logger.warning(f"Pendekatan 1 gagal: {e}")
+            # Tutup koneksi yang mungkin sebagian terbentuk
+            try:
+                lidar.disconnect()
             except:
                 pass
         
-        logger.info(f"Initializing A2M12 LiDAR on {PORT_LIDAR} at {BAUDRATE_LIDAR} baud")
-        lidar = RPLidar(PORT_LIDAR, baudrate=BAUDRATE_LIDAR, timeout=LIDAR_TIMEOUT)
+        # Pendekatan 2: Gunakan set_pwm sebelum memulai scan (teknik khusus untuk A2M12)
+        try:
+            logger.info("Mencoba pendekatan alternatif untuk A2M12...")
+            lidar = RPLidar(PORT_LIDAR, baudrate=BAUDRATE_LIDAR, timeout=3.0)
+            time.sleep(1.0)
+            
+            # Bagian krusial untuk A2M12: reset dan set PWM secara manual
+            # Pertama reset motor
+            lidar._send_cmd(0x40)  # CMD_RESET - Perintah manual reset
+            time.sleep(2.0)  # Beri waktu untuk reset
+            
+            # Kemudian stop scanning jika masih berjalan
+            lidar.stop()
+            time.sleep(0.5)
+            
+            # Set motor PWM (0-100%)
+            # Mulai dengan nilai rendah dan tingkatkan perlahan
+            for pwm in [0, 25, 50, 75, 100]:
+                try:
+                    lidar.set_pwm(pwm)
+                    time.sleep(0.5)
+                except:
+                    pass
+            
+            # Coba verifikasi koneksi dengan get_info
+            try:
+                info = lidar.get_info()
+                logger.info(f"Pendekatan 2 berhasil, terhubung ke LIDAR: {info}")
+                
+                # Set health LIDAR ke connected
+                with data_lock:
+                    lidar_health["connected"] = True
+                    lidar_health["last_scan_time"] = time.time()
+                    lidar_health["error_count"] = 0
+                
+                return True
+            except:
+                logger.warning("Gagal mendapatkan info LIDAR tetapi koneksi mungkin masih valid")
+                # Koneksi mungkin valid meskipun get_info() gagal pada beberapa model A2M12
+                
+                # Coba memulai scan untuk verifikasi
+                try:
+                    # Mulai scan dan ambil beberapa data untuk verifikasi
+                    lidar.start_motor()
+                    time.sleep(1.0)
+                    scan_iter = lidar.iter_scans(max_buf_meas=100)
+                    for i, scan in enumerate(scan_iter):
+                        if len(scan) > 0:
+                            logger.info(f"Berhasil mendapatkan {len(scan)} poin data LIDAR")
+                            
+                            # Set health LIDAR ke connected
+                            with data_lock:
+                                lidar_health["connected"] = True
+                                lidar_health["last_scan_time"] = time.time()
+                                lidar_health["error_count"] = 0
+                            
+                            return True
+                        if i >= 2:  # Coba hanya beberapa scan
+                            break
+                except Exception as e:
+                    logger.error(f"Gagal verifikasi scan: {e}")
+        except Exception as e:
+            logger.warning(f"Pendekatan 2 gagal: {e}")
+            try:
+                lidar.disconnect()
+            except:
+                pass
         
-        # Check info and health
-        info = lidar.get_info()
-        health = lidar.get_health()
+        # Pendekatan 3: Coba dengan baudrate alternatif untuk A2M12
+        alternative_baudrates = [256000, 153600, 128000, 115200]
+        for alt_baudrate in alternative_baudrates:
+            if alt_baudrate == BAUDRATE_LIDAR:
+                continue  # Lewati jika sama dengan yang sudah dicoba
+                
+            try:
+                logger.info(f"Mencoba dengan baudrate alternatif: {alt_baudrate}")
+                lidar = RPLidar(PORT_LIDAR, baudrate=alt_baudrate, timeout=3.0)
+                time.sleep(1.0)
+                
+                # Coba verifikasi koneksi
+                info = lidar.get_info()
+                logger.info(f"Berhasil terhubung dengan baudrate {alt_baudrate}: {info}")
+                
+                # Set health LIDAR ke connected
+                with data_lock:
+                    lidar_health["connected"] = True
+                    lidar_health["last_scan_time"] = time.time()
+                    lidar_health["error_count"] = 0
+                
+                return True
+            except Exception as e:
+                logger.warning(f"Baudrate {alt_baudrate} gagal: {e}")
+                try:
+                    lidar.disconnect()
+                except:
+                    pass
         
-        logger.info(f"A2M12 LiDAR info: {info}")
-        logger.info(f"A2M12 LiDAR health: {health}")
+        # Jika semua pendekatan gagal
+        logger.error("Semua pendekatan inisialisasi A2M12 LIDAR gagal")
+        return False
         
-        with data_lock:
-            lidar_health["connected"] = True
-            lidar_health["error_count"] = 0
-            lidar_health["last_scan_time"] = time.time()
-        
-        # Reset motor speed to ensure proper scan rate
-        lidar.motor_speed = 0  # First reset
-        time.sleep(0.1)
-        lidar.motor_speed = 660  # Set to standard A2M12 RPM
-        time.sleep(1.0)  # Allow motor to stabilize
-        
-        return True
-    
     except Exception as e:
-        logger.error(f"LiDAR initialization error: {e}")
+        logger.error(f"Error inisialisasi LIDAR: {e}")
+        
+        # Reset health LIDAR ke disconnected
         with data_lock:
             lidar_health["connected"] = False
             lidar_health["error_count"] += 1
+        
+        # Pastikan lidar ditutup jika ada kesalahan
+        try:
+            if lidar is not None:
+                lidar.stop()
+                lidar.disconnect()
+        except:
+            pass
         
         return False
 
