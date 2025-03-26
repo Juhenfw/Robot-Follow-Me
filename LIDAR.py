@@ -338,111 +338,213 @@ def detect_person(angles, distances):
     return None, None
 
 def process_lidar_data():
-    """Updates LiDAR data continuously for A2M12."""
+    """Memproses data LIDAR A2M12 secara real-time dengan optimasi khusus."""
     global running, angles, distances, colors, target_angle, target_distance, lidar_health
     
-    scan_history = []  # For temporal smoothing
-    last_error_time = 0
-    reconnect_cooldown = 5  # Seconds between reconnection attempts
+    # Parameter khusus untuk A2M12
+    A2M12_MIN_QUALITY = 12        # Nilai minimum kualitas sinyal yang valid untuk A2M12
+    A2M12_MOTOR_SPEED = 660       # Kecepatan motor optimal untuk A2M12 (RPM)
+    A2M12_MAX_DISTANCE = 12000    # Jarak maksimum valid untuk A2M12 (mm)
+    A2M12_MIN_DISTANCE = 150      # Jarak minimum valid untuk A2M12 (mm)
+    A2M12_SCAN_FREQUENCY = 10     # Frekuensi pemindaian A2M12 (Hz)
+    A2M12_SCAN_INTERVAL = 1/A2M12_SCAN_FREQUENCY  # Interval antara pemindaian
     
-    # Initialize LiDAR
+    scan_history = []  # Untuk smoothing temporal
+    last_error_time = 0
+    reconnect_cooldown = 5  # Detik antara percobaan koneksi ulang
+    
+    # Inisialisasi LIDAR A2M12
     if not initialize_lidar():
-        logger.error("Failed to initialize A2M12 LiDAR")
+        logger.error("Gagal menginisialisasi LIDAR A2M12")
         with data_lock:
             lidar_health["connected"] = False
     
     try:
         while running:
+            scan_start_time = time.time()
+            
             try:
-                # Check if LiDAR needs reconnection
+                # Periksa apakah LIDAR perlu disambungkan kembali
                 with data_lock:
                     connected = lidar_health["connected"]
                     last_scan = lidar_health["last_scan_time"]
                 
                 if not connected and time.time() - last_error_time > reconnect_cooldown:
-                    logger.info("Attempting to reconnect A2M12 LiDAR...")
+                    logger.info("Mencoba menyambungkan kembali LIDAR A2M12...")
                     if initialize_lidar():
-                        logger.info("A2M12 LiDAR reconnected successfully")
+                        # Set ulang kecepatan motor untuk A2M12
+                        with lidar_lock:
+                            lidar.motor_speed = 0  # Reset dulu
+                            time.sleep(0.1)
+                            lidar.motor_speed = A2M12_MOTOR_SPEED  # Set ke RPM standar A2M12
+                            time.sleep(1.0)  # Biarkan motor stabil
+                        logger.info("LIDAR A2M12 berhasil tersambung kembali")
                     else:
                         last_error_time = time.time()
                         time.sleep(1)
                         continue
                 
-                # Check for stale data
-                if time.time() - last_scan > 5:  # No scans for 5 seconds
-                    logger.warning("LiDAR data is stale, attempting to restart...")
+                # Periksa data yang usang
+                if time.time() - last_scan > 5:  # Tidak ada pemindaian selama 5 detik
+                    logger.warning("Data LIDAR usang, mencoba restart...")
                     initialize_lidar()
                     time.sleep(1)
                     continue
                 
-                # Get a single scan (optimized for A2M12)
-                with lidar_lock:
-                    scan = list(next(lidar.iter_scans()))
+                # Dapatkan satu pemindaian (dioptimalkan untuk A2M12)
+                filtered_angles = []
+                filtered_distances = []
                 
+                with lidar_lock:
+                    # Untuk A2M12, membatasi jumlah poin per pemindaian meningkatkan keandalan
+                    scan_count = 0
+                    max_points = 360  # A2M12 biasanya memberikan ~360 poin per putaran
+                    
+                    # Gunakan iterator pemindaian khusus untuk A2M12
+                    scan_iter = lidar.iter_scans(max_buf_meas=2000)  # Buffer yang lebih besar untuk A2M12
+                    scan = next(scan_iter)
+                    
+                    # Filter kualitas khusus A2M12
+                    for quality, angle, distance in scan:
+                        scan_count += 1
+                        
+                        # A2M12 memiliki kriteria kualitas sinyal yang spesifik
+                        if (quality >= A2M12_MIN_QUALITY and 
+                            A2M12_MIN_DISTANCE <= distance <= A2M12_MAX_DISTANCE):
+                            
+                            # Koreksi sudut untuk A2M12 (jika diperlukan)
+                            corrected_angle = angle
+                            if corrected_angle < 0:
+                                corrected_angle += 360
+                                
+                            filtered_angles.append(corrected_angle)
+                            filtered_distances.append(distance)
+                            
+                        if scan_count >= max_points:
+                            break
+                
+                # Update status kesehatan LIDAR
                 with data_lock:
                     lidar_health["last_scan_time"] = time.time()
                     lidar_health["connected"] = True
                 
-                # Process and filter scan data
-                filtered_angles, filtered_distances = filter_lidar_data(scan)
+                # Jika tidak ada data yang valid, lanjutkan ke pemindaian berikutnya
+                if not filtered_angles:
+                    logger.debug("Tidak ada data valid pada pemindaian A2M12 ini")
+                    time.sleep(0.05)
+                    continue
                 
-                # Add to history for temporal smoothing
+                # Tambahkan ke riwayat untuk smoothing temporal
                 scan_history.append((filtered_angles, filtered_distances))
-                if len(scan_history) > SCAN_HISTORY_SIZE:
+                if len(scan_history) > 3:  # Simpan 3 pemindaian terakhir
                     scan_history.pop(0)
                 
-                # Detect person from filtered data
+                # Terapkan pemfilteran temporal untuk mengurangi noise
+                if len(scan_history) >= 2:
+                    # Gunakan pemindaian saat ini dan sebelumnya untuk smoothing
+                    current_angles, current_distances = filtered_angles, filtered_distances
+                    prev_angles, prev_distances = scan_history[-2]
+                    
+                    # Jika ada perbedaan besar dalam jarak untuk sudut yang sama, gunakan nilai rata-rata
+                    combined_angles = []
+                    combined_distances = []
+                    
+                    # Buat dictionary dari pemindaian saat ini
+                    current_dict = {int(angle): dist for angle, dist in zip(current_angles, current_distances)}
+                    prev_dict = {int(angle): dist for angle, dist in zip(prev_angles, prev_distances)}
+                    
+                    # Gabungkan hasil dari kedua pemindaian
+                    all_angles = sorted(set(list(current_dict.keys()) + list(prev_dict.keys())))
+                    
+                    for angle in all_angles:
+                        if angle in current_dict and angle in prev_dict:
+                            dist_diff = abs(current_dict[angle] - prev_dict[angle])
+                            # Jika perbedaan jarak terlalu besar, mungkin ada noise
+                            if dist_diff > 300:  # 30cm perbedaan
+                                # Gunakan yang lebih dekat (lebih mungkin sebagai objek nyata)
+                                smoothed_dist = min(current_dict[angle], prev_dict[angle])
+                            else:
+                                # Rata-rata untuk smoothing
+                                smoothed_dist = (current_dict[angle] + prev_dict[angle]) / 2
+                            
+                            combined_angles.append(angle)
+                            combined_distances.append(smoothed_dist)
+                        elif angle in current_dict:
+                            combined_angles.append(angle)
+                            combined_distances.append(current_dict[angle])
+                        else:
+                            combined_angles.append(angle)
+                            combined_distances.append(prev_dict[angle])
+                    
+                    # Update dengan data yang sudah di-smoothing
+                    filtered_angles = combined_angles
+                    filtered_distances = combined_distances
+                
+                # Update data global untuk visualisasi dan deteksi
+                with data_lock:
+                    angles = filtered_angles
+                    distances = filtered_distances
+                    colors = [(0, 255, 0) for _ in range(len(filtered_angles))]  # Warna hijau untuk semua poin
+                
+                # Deteksi orang dari data yang difilter
                 person_angle, person_distance = detect_person(filtered_angles, filtered_distances)
                 
-                # Update global target if person detected
+                # Update target global jika orang terdeteksi
                 if person_angle is not None and person_distance is not None:
                     with data_lock:
                         target_angle = person_angle
                         target_distance = person_distance
                     
                     direction = get_direction_name(person_angle)
-                    logger.debug(f"LiDAR Target: {direction} at angle={person_angle:.2f}°, distance={person_distance/10:.2f}cm")
+                    logger.debug(f"Target LIDAR: {direction} pada sudut={person_angle:.2f}°, jarak={person_distance/10:.2f}cm")
                 
-                # Scan rate control - A2M12 works best with some delay between processing scans
-                time.sleep(0.05)
+                # Kendali laju pemindaian - A2M12 bekerja paling baik dengan sedikit jeda antara pemrosesan pemindaian
+                elapsed = time.time() - scan_start_time
+                if elapsed < A2M12_SCAN_INTERVAL:
+                    time.sleep(A2M12_SCAN_INTERVAL - elapsed)
             
             except RPLidarException as e:
-                logger.error(f"A2M12 LiDAR error: {e}")
+                logger.error(f"Error LIDAR A2M12: {e}")
                 with data_lock:
                     lidar_health["connected"] = False
                     lidar_health["error_count"] += 1
                 
                 last_error_time = time.time()
                 
-                # Try to recover
+                # Coba untuk pulih
                 try:
                     with lidar_lock:
                         lidar.stop()
                         time.sleep(0.5)
+                        lidar.disconnect()
+                        time.sleep(0.5)
                 except:
                     pass
                 
-                time.sleep(1)  # Cool-down before retry
+                time.sleep(1)  # Pendinginan sebelum mencoba lagi
             
             except StopIteration:
-                logger.warning("A2M12 LiDAR scan iteration ended, restarting...")
-                initialize_lidar()
+                logger.warning("Iterasi pemindaian LIDAR A2M12 berakhir, memulai ulang...")
+                try:
+                    initialize_lidar()
+                except:
+                    logger.error("Gagal memulai ulang LIDAR A2M12")
                 time.sleep(0.5)
             
             except Exception as e:
-                logger.error(f"Unexpected A2M12 LiDAR error: {e}")
+                logger.error(f"Error LIDAR A2M12 tidak terduga: {e}")
                 last_error_time = time.time()
                 time.sleep(1)
     
     except KeyboardInterrupt:
-        logger.info("LiDAR operation stopped by user.")
+        logger.info("Operasi LIDAR dihentikan oleh pengguna.")
     finally:
-        if running:  # Only stop if we're still running (avoid double-stop)
+        if running:  # Hanya berhenti jika kita masih berjalan (hindari double-stop)
             try:
                 with lidar_lock:
                     lidar.stop()
                     lidar.disconnect()
-                logger.info("A2M12 LiDAR stopped and disconnected.")
+                logger.info("LIDAR A2M12 dihentikan dan diputuskan.")
             except:
                 pass
 
