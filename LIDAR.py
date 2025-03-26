@@ -2,6 +2,7 @@ import math
 import numpy as np
 import time
 import serial
+import pygame
 import ddsm115 as motor
 from rplidar import RPLidar
 from threading import Thread
@@ -26,6 +27,14 @@ colors = []
 uwb_distance = None
 target_angle = None
 target_distance = None
+autonomous_mode = True  # True for follow mode, False for manual control
+
+# Initialize pygame for manual control
+pygame.init()
+screen = pygame.display.set_mode((800, 600))
+pygame.display.set_caption("Follow Me Robot - Press TAB to switch modes")
+clock = pygame.time.Clock()
+font = pygame.font.SysFont(None, 36)
 
 # Initialize wheel motors
 right_motor = motor.MotorControl(device=RIGHT_WHEEL_PORT)
@@ -63,6 +72,19 @@ def calculate_rotation(target_angle, current_angle):
         
     return angle_diff
 
+def get_direction_name(angle):
+    """Convert angle to human-readable direction."""
+    directions = ["Front", "Front-Right", "Right", "Back-Right", 
+                 "Back", "Back-Left", "Left", "Front-Left"]
+    
+    # Normalize angle to 0-360
+    normalized_angle = angle % 360
+    
+    # Convert to direction index (8 directions)
+    index = round(normalized_angle / 45) % 8
+    
+    return directions[index]
+
 def move_robot(forward_speed, rotation_speed):
     """
     Controls robot movement using differential drive.
@@ -82,7 +104,21 @@ def move_robot(forward_speed, rotation_speed):
     right_motor.send_rpm(1, -right_speed)  # Inverted based on motor orientation
     left_motor.send_rpm(1, left_speed)
     
-    print(f"Moving: R={-right_speed}, L={left_speed}")
+    # Create movement description
+    movement_desc = ""
+    if forward_speed > 5:
+        movement_desc += "Moving Forward"
+    elif forward_speed < -5:
+        movement_desc += "Moving Backward"
+    else:
+        movement_desc += "Stationary"
+        
+    if rotation_speed > 5:
+        movement_desc += " + Rotating Left"
+    elif rotation_speed < -5:
+        movement_desc += " + Rotating Right"
+    
+    print(f"Movement: {movement_desc} (R={-right_speed:.1f}, L={left_speed:.1f})")
 
 def read_uwb_data():
     """Reads data from UWB sensor."""
@@ -148,7 +184,8 @@ def update_lidar():
                 target_angle = scan_angles[min_distance_idx]
                 target_distance = scan_distances[min_distance_idx]
                 
-                print(f"LiDAR Target: angle={target_angle:.2f}°, distance={target_distance/10:.2f}cm")
+                direction = get_direction_name(target_angle)
+                print(f"LiDAR Target: {direction} at angle={target_angle:.2f}°, distance={target_distance/10:.2f}cm")
             
             time.sleep(0.05)
             
@@ -160,11 +197,16 @@ def update_lidar():
             print("LiDAR stopped.")
 
 def follow_person():
-    """Main control logic to follow a person."""
-    global running, uwb_distance, target_angle, target_distance
+    """Autonomous control logic to follow a person."""
+    global running, uwb_distance, target_angle, target_distance, autonomous_mode
     
     try:
         while running:
+            # Skip if in manual mode
+            if not autonomous_mode:
+                time.sleep(0.1)
+                continue
+                
             if uwb_distance is None or target_angle is None:
                 # No sensor data yet, wait
                 time.sleep(0.1)
@@ -178,11 +220,19 @@ def follow_person():
             if target_angle is not None:
                 angle_error = calculate_rotation(target_angle, 0)  # Assuming 0 is forward
                 
+                direction = get_direction_name(target_angle)
+                
                 if abs(angle_error) > ANGLE_TOLERANCE:
                     # Need to rotate to face person
                     rotation_speed = min(max(angle_error / 2, -NORMAL_SPEED), NORMAL_SPEED)
                     rotation_command = rotation_speed
-                    print(f"Rotating to face target: {angle_error:.2f}°")
+                    
+                    if rotation_speed > 0:
+                        print(f"Navigation: Need to rotate LEFT to face target at {direction}")
+                    else:
+                        print(f"Navigation: Need to rotate RIGHT to face target at {direction}")
+                else:
+                    print(f"Navigation: Target angle good, facing {direction}")
                 
             # Determine forward/backward command (based on UWB distance)
             if uwb_distance is not None:
@@ -194,12 +244,14 @@ def follow_person():
                         # Too far, move forward
                         forward_speed = min(distance_error / 3, NORMAL_SPEED)
                         forward_command = forward_speed
-                        print(f"Moving forward: {distance_error:.2f}cm too far")
+                        print(f"Navigation: Need to move FORWARD {distance_error:.2f}cm to reach target distance")
                     else:
                         # Too close, move backward
                         forward_speed = max(distance_error / 3, -NORMAL_SPEED)
                         forward_command = forward_speed
-                        print(f"Moving backward: {-distance_error:.2f}cm too close")
+                        print(f"Navigation: Need to move BACKWARD {-distance_error:.2f}cm (too close)")
+                else:
+                    print(f"Navigation: Distance good at {uwb_distance:.2f}cm")
             
             # Execute movement
             move_robot(forward_command, rotation_command)
@@ -209,6 +261,221 @@ def follow_person():
         print("Follow operation stopped by user.")
     except Exception as e:
         print(f"Follow Error: {e}")
+
+def handle_manual_control():
+    """Process manual control inputs."""
+    global running, autonomous_mode
+    
+    try:
+        while running:
+            # Skip if in autonomous mode
+            if autonomous_mode:
+                time.sleep(0.1)
+                continue
+                
+            # Update pygame events
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_TAB:
+                        autonomous_mode = not autonomous_mode
+                        mode_str = "AUTONOMOUS" if autonomous_mode else "MANUAL"
+                        print(f"Switching to {mode_str} control mode")
+            
+            # Get pressed keys
+            keys = pygame.key.get_pressed()
+            
+            # Check for mode switch
+            if keys[pygame.K_TAB]:
+                # Already handled in event loop to avoid repeats
+                pass
+                
+            # Variable to track if we're in drift mode
+            drifting = keys[pygame.K_LSHIFT]
+            
+            # Reset speeds
+            right_speed = STOP
+            left_speed = STOP
+            
+            # ======== Combination Keys for Turning & Drift ========
+            if keys[pygame.K_w] and keys[pygame.K_a]:  # Forward + Left
+                if drifting:  # Drift mode
+                    right_speed = -DRIFT_BOOST
+                    left_speed = TURNING_SPEED
+                else:  # Normal mode
+                    right_speed = -NORMAL_SPEED
+                    left_speed = TURNING_SPEED
+            elif keys[pygame.K_w] and keys[pygame.K_d]:  # Forward + Right
+                if drifting:
+                    right_speed = -TURNING_SPEED
+                    left_speed = -DRIFT_BOOST
+                else:
+                    right_speed = -TURNING_SPEED
+                    left_speed = NORMAL_SPEED
+            elif keys[pygame.K_s] and keys[pygame.K_a]:  # Backward + Left
+                if drifting:
+                    right_speed = NORMAL_SPEED
+                    left_speed = -DRIFT_BOOST
+                else:
+                    right_speed = NORMAL_SPEED
+                    left_speed = -TURNING_SPEED
+            elif keys[pygame.K_s] and keys[pygame.K_d]:  # Backward + Right
+                if drifting:
+                    right_speed = DRIFT_BOOST
+                    left_speed = -NORMAL_SPEED
+                else:
+                    right_speed = TURNING_SPEED
+                    left_speed = -NORMAL_SPEED
+                    
+            # ======== Normal Movement Controls ========
+            elif keys[pygame.K_w]:  # Forward
+                right_speed = -NORMAL_SPEED
+                left_speed = NORMAL_SPEED
+            elif keys[pygame.K_s]:  # Backward
+                right_speed = NORMAL_SPEED
+                left_speed = -NORMAL_SPEED
+            elif keys[pygame.K_a]:  # Rotate left
+                right_speed = -SLOW_SPEED
+                left_speed = -SLOW_SPEED
+            elif keys[pygame.K_d]:  # Rotate right
+                right_speed = SLOW_SPEED
+                left_speed = SLOW_SPEED
+            elif keys[pygame.K_SPACE]:  # Fast rotation
+                right_speed = -NORMAL_SPEED
+                left_speed = -NORMAL_SPEED
+            elif keys[pygame.K_p]:  # Exit program
+                running = False
+                
+            # Send commands to motors
+            right_motor.send_rpm(1, right_speed)
+            left_motor.send_rpm(1, left_speed)
+            
+            # Update display
+            screen.fill((0, 0, 0))
+            
+            # Display current mode
+            mode_text = "MODE: MANUAL CONTROL" if not autonomous_mode else "MODE: AUTONOMOUS FOLLOW"
+            mode_surface = font.render(mode_text, True, (255, 255, 255))
+            screen.blit(mode_surface, (20, 20))
+            
+            # Display control instructions
+            controls = [
+                "TAB: Switch Mode",
+                "W/A/S/D: Movement",
+                "SPACE: Fast Rotation",
+                "SHIFT: Drift Mode",
+                "P: Exit Program"
+            ]
+            
+            for i, control in enumerate(controls):
+                control_surface = font.render(control, True, (200, 200, 200))
+                screen.blit(control_surface, (20, 70 + i * 30))
+                
+            # Display sensor data if available
+            if uwb_distance is not None:
+                uwb_text = f"UWB Distance: {uwb_distance:.2f} cm"
+                uwb_surface = font.render(uwb_text, True, (255, 200, 0))
+                screen.blit(uwb_surface, (20, 300))
+                
+            if target_angle is not None and target_distance is not None:
+                lidar_text = f"Target: {get_direction_name(target_angle)} at {target_distance/10:.2f} cm"
+                lidar_surface = font.render(lidar_text, True, (0, 255, 200))
+                screen.blit(lidar_surface, (20, 340))
+                
+            # Update display
+            pygame.display.flip()
+            clock.tick(30)  # Limit to 30 FPS
+            
+    except Exception as e:
+        print(f"Manual control error: {e}")
+
+def update_ui():
+    """Updates pygame UI in both modes."""
+    global running, autonomous_mode, uwb_distance, target_angle, target_distance
+    
+    try:
+        while running:
+            # Handle mode switching
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_TAB:
+                        autonomous_mode = not autonomous_mode
+                        mode_str = "AUTONOMOUS" if autonomous_mode else "MANUAL"
+                        print(f"Switching to {mode_str} control mode")
+                    elif event.key == pygame.K_p:
+                        running = False
+            
+            # Update display
+            screen.fill((0, 0, 0))
+            
+            # Display current mode
+            mode_text = "MODE: AUTONOMOUS FOLLOW" if autonomous_mode else "MODE: MANUAL CONTROL"
+            mode_color = (0, 255, 0) if autonomous_mode else (255, 100, 100)
+            mode_surface = font.render(mode_text, True, mode_color)
+            screen.blit(mode_surface, (20, 20))
+            
+            # Display control instructions
+            controls = [
+                "TAB: Switch Mode",
+                "W/A/S/D: Movement (Manual Mode)",
+                "SPACE: Fast Rotation (Manual Mode)",
+                "SHIFT: Drift Mode (Manual Mode)",
+                "P: Exit Program"
+            ]
+            
+            for i, control in enumerate(controls):
+                control_surface = font.render(control, True, (200, 200, 200))
+                screen.blit(control_surface, (20, 70 + i * 30))
+                
+            # Display sensor data if available
+            if uwb_distance is not None:
+                uwb_text = f"UWB Distance: {uwb_distance:.2f} cm"
+                uwb_surface = font.render(uwb_text, True, (255, 200, 0))
+                screen.blit(uwb_surface, (20, 300))
+                
+            if target_angle is not None and target_distance is not None:
+                target_dir = get_direction_name(target_angle)
+                lidar_text = f"Target: {target_dir} at {target_distance/10:.2f} cm"
+                lidar_surface = font.render(lidar_text, True, (0, 255, 200))
+                screen.blit(lidar_surface, (20, 340))
+                
+                # Draw a simple visualization of target position
+                center_x, center_y = 600, 400
+                radius = 150
+                # Convert angle to radians and adjust for coordinate system
+                angle_rad = math.radians(90 - target_angle)
+                # Calculate target position
+                target_x = center_x + radius * math.cos(angle_rad) 
+                target_y = center_y - radius * math.sin(angle_rad)
+                
+                # Draw circle representing robot's sensing range
+                pygame.draw.circle(screen, (50, 50, 50), (center_x, center_y), radius, 1)
+                # Draw line pointing to target
+                pygame.draw.line(screen, (0, 200, 0), (center_x, center_y), (target_x, target_y), 2)
+                # Draw robot position
+                pygame.draw.circle(screen, (200, 200, 200), (center_x, center_y), 15)
+                # Draw target position
+                pygame.draw.circle(screen, (255, 0, 0), (int(target_x), int(target_y)), 8)
+                
+                # Label directions
+                dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+                for i, d in enumerate(dirs):
+                    angle = math.radians(i * 45)
+                    dir_x = center_x + (radius + 20) * math.sin(angle)
+                    dir_y = center_y - (radius + 20) * math.cos(angle)
+                    dir_surface = font.render(d, True, (100, 100, 100))
+                    dir_rect = dir_surface.get_rect(center=(dir_x, dir_y))
+                    screen.blit(dir_surface, dir_rect)
+                
+            # Update display
+            pygame.display.flip()
+            clock.tick(30)  # Limit to 30 FPS
+            
+    except Exception as e:
+        print(f"UI update error: {e}")
 
 def cleanup():
     """Cleans up resources before exiting."""
@@ -230,27 +497,37 @@ def cleanup():
     except:
         pass
     
+    # Quit pygame
+    pygame.quit()
+    
     print("All systems stopped and disconnected.")
 
 def main():
     """Main program entry point."""
-    global running
+    global running, autonomous_mode
     
     print("Starting Follow Me Robot System...")
+    print("Press TAB to switch between autonomous and manual control modes")
+    
     running = True
+    autonomous_mode = True  # Start in autonomous mode by default
     
     # Start sensor threads
     uwb_thread = Thread(target=read_uwb_data, daemon=True)
     lidar_thread = Thread(target=update_lidar, daemon=True)
+    follow_thread = Thread(target=follow_person, daemon=True)
+    ui_thread = Thread(target=update_ui, daemon=True)
     
     uwb_thread.start()
     lidar_thread.start()
+    follow_thread.start()
+    ui_thread.start()
     
     time.sleep(2)  # Give sensors time to start up
     
     try:
-        # Start following behavior
-        follow_person()
+        # Handle manual control (if active)
+        handle_manual_control()
     except KeyboardInterrupt:
         print("Program terminated by user.")
     finally:
