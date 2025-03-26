@@ -14,7 +14,14 @@ timeout_uwb = 1
 PORT_LIDAR = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_f235ae4105e1d247940e6441b646a0b3-if00-port0"
 lidar = RPLidar(PORT_LIDAR, baudrate=256000)
 
-# Robot motion functions
+# Variabel global untuk pengendalian program
+running = False
+thread = None
+angles = []
+distances = []
+colors = []
+
+# Fungsi untuk menggerakkan robot sesuai perintah
 def move_robot(command):
     """
     Fungsi untuk menggerakkan robot sesuai perintah.
@@ -48,7 +55,7 @@ def calculate_rotation(target_angle, current_angle):
         angle_diff += 360  # Putar ke arah pendek
     return angle_diff
 
-# Fungsi untuk memutar robot
+# Fungsi untuk memutar robot dengan sudut tertentu
 def rotate_robot(rotation_angle):
     """
     Fungsi untuk memutar robot dengan sudut tertentu.
@@ -65,15 +72,16 @@ def track_person_with_lidar(lidar):
     angles = []
     distances = []
 
+    # Iterasi melalui pemindaian LiDAR
     for scan in lidar.iter_scans():
         angles.clear()
         distances.clear()
 
-        for _, angle, distance in scan:
-            if distance <= 2000:  # Batas jarak (misalnya 2 meter)
+        for new_scan, quality, angle, distance in scan:
+            if distance <= 2000:  # Batasi hanya untuk jarak ≤ 2000 mm
                 angles.append(np.deg2rad(angle))  # Ubah sudut menjadi radian
                 distances.append(distance)
-        
+
         if distances:
             # Temukan orang yang paling dekat (dengan jarak terpendek)
             closest_person_distance = min(distances)
@@ -126,6 +134,35 @@ def read_uwb_data():
             ser.close()
             print("Serial connection closed.")
 
+# Fungsi untuk memperbarui data LiDAR
+def update_lidar():
+    global running, angles, distances, colors
+    try:
+        while running:
+            for scan in lidar.iter_scans():
+                if not running:
+                    break  # Exit the loop if LiDAR is stopped
+                
+                angles.clear()
+                distances.clear()
+                colors.clear()
+                
+                for _, angle, distance in scan:
+                    if distance <= 2000:  # Limit to a max distance of 2000 mm
+                        angles.append(np.deg2rad(angle))  # Convert to radians
+                        distances.append(distance)
+
+                        # Assign colors based on distance
+                        if distance < 500:
+                            colors.append('red')  # Close object
+                        elif distance < 1500:
+                            colors.append('orange')  # Medium range object
+                        else:
+                            colors.append('purple')  # Far object
+        lidar.stop()
+    except Exception as e:
+        print(f"Error: {e}")
+
 # Fungsi utama untuk kontrol robot menggunakan UWB dan LiDAR
 def control_lidar_and_robot():
     """
@@ -162,12 +199,21 @@ def control_lidar_and_robot():
 if __name__ == "__main__":
     # Deklarasi global untuk 'running' dan 'thread'
     global running
-    running = False  # Pastikan 'running' didefinisikan
+    running = False  # Initializing 'running' here
     thread = None  # Inisialisasi thread jika belum ada
 
-    # Mulai membaca data UWB di thread terpisah
-    uwb_thread = Thread(target=read_uwb_data, daemon=True)
-    uwb_thread.start()
+    try:
+        # Start UWB and LiDAR threads
+        uwb_thread = Thread(target=read_uwb_data, daemon=True)
+        uwb_thread.start()
 
-    # Mulai kontrol LiDAR di thread terpisah
-    control_lidar_and_robot()
+        # Start control for LiDAR
+        control_lidar_and_robot()
+
+    except KeyboardInterrupt:
+        print("Shutting down...")
+    finally:
+        # Ensure proper cleanup
+        lidar.stop()
+        lidar.disconnect()
+        print("LiDAR disconnected.")
