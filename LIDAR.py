@@ -4,431 +4,162 @@ import time
 import serial
 import pygame
 import ddsm115 as motor
-from rplidar import RPLidar
-from threading import Thread
-from collections import deque
+from rplidar import RPLidar, RPLidarException
+from threading import Thread, Lock
+import logging
 
-# Configuration parameters unchanged...
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('follow_robot')
 
-# NEW: Obstacle avoidance parameters
-OBSTACLE_DETECTION_RANGE = 100  # cm
-OBSTACLE_SAFE_DISTANCE = 40     # cm
-OBSTACLE_CRITICAL_DISTANCE = 30 # cm
-OBSTACLE_WEIGHT = 1.5           # Weight of obstacle avoidance vs. person following
-FIELD_OF_VIEW = 220             # degrees - detect obstacles in front and sides
-SIDE_CLEARANCE = 25             # cm - minimum side clearance
+# UWB Configuration
+PORT_UWB = "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
+BAUDRATE_UWB = 115200
+TIMEOUT_UWB = 1
 
-# NEW: Enhanced person tracking 
-TRACKING_TIMEOUT = 2.0          # seconds until we consider person lost
-PERSON_WIDTH_TOLERANCE = 0.15   # meters - added tolerance for person width
-TRACKING_CONFIDENCE_THRESHOLD = 0.6  # minimum confidence to consider valid
+# LiDAR Configuration - A2M12 settings
+PORT_LIDAR = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_f235ae4105e1d247940e6441b646a0b3-if00-port0"
+BAUDRATE_LIDAR = 115200  # A2M12 standard baudrate
+LIDAR_TIMEOUT = 3  # Timeout for lidar operations in seconds
 
-# Existing global variables...
+# Wheel Configuration
+RIGHT_WHEEL_PORT = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_B0049TUZ-if00-port0"
+LEFT_WHEEL_PORT = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_B0045S9B-if00-port0"
 
-# NEW: Global variables for obstacle avoidance
-obstacles = []  # List of detected obstacles [angle, distance, size]
-obstacle_vectors = []  # Repulsive vectors from obstacles
-last_person_detection = 0  # Timestamp of last confident person detection
-person_tracking_id = None  # For continuous tracking of the same person
-person_tracking_confidence = 0.0  # Current tracking confidence
+# Global variables
+running = False
+lidar_lock = Lock()  # Lock for thread-safe lidar access
+data_lock = Lock()   # Lock for shared data access
 
-# Modified buffer sizes for better responsiveness
-uwb_distance_buffer = deque(maxlen=3)  # Reduced buffer size for faster response
-target_angle_buffer = deque(maxlen=3)
-target_distance_buffer = deque(maxlen=3)
+# Sensor data
+angles = []
+distances = []
+colors = []
+uwb_distance = None
+target_angle = None
+target_distance = None
+lidar_health = {"connected": False, "error_count": 0, "last_scan_time": 0}
 
-# NEW: Create a tracking history for better prediction during brief sensor outages
-person_position_history = deque(maxlen=20)  # Store [time, angle, distance] tuples
+# Control mode
+autonomous_mode = True  # True for follow mode, False for manual control
 
-def median_filter(values):
-    """Apply median filter to remove outliers."""
-    if not values:
-        return None
-    return sorted(values)[len(values)//2]
+# Initialize pygame for manual control
+pygame.init()
+screen = pygame.display.set_mode((800, 600))
+pygame.display.set_caption("Follow Me Robot - Press TAB to switch modes")
+clock = pygame.time.Clock()
+font = pygame.font.SysFont(None, 36)
 
-# MODIFIED: Enhanced distance correction with improved bias handling
-def correct_bias(raw_distance, bias=0):
-    """Corrects bias in UWB sensor readings with dynamic calibration."""
-    # Apply nonlinear correction for different distance ranges
-    if raw_distance < 50:  # Close range correction
-        correction_factor = 0.9
-        bias = 5  # More aggressive bias correction at close range
-    elif raw_distance < 150:  # Mid range
-        correction_factor = 0.95
-        bias = 2
-    else:  # Far range
-        correction_factor = 1.0
-        bias = 0
-        
-    # Apply corrections
-    corrected_distance = (raw_distance * correction_factor) - bias
-    
-    # Enforce reasonable limits
-    return max(20, min(300, corrected_distance))
+# Initialize wheel motors
+right_motor = motor.MotorControl(device=RIGHT_WHEEL_PORT)
+right_motor.set_drive_mode(1, 2)
+left_motor = motor.MotorControl(device=LEFT_WHEEL_PORT)
+left_motor.set_drive_mode(1, 2)
 
-# NEW: Vector-based obstacle avoidance
-def calculate_obstacle_avoidance_vector():
-    """Calculate repulsive vector from obstacles."""
-    if not obstacles:
-        return 0, 0  # No obstacles, no avoidance vector
-    
-    # Initialize repulsive vector components
-    repulsive_x = 0
-    repulsive_y = 0
-    
-    for angle, distance, size in obstacles:
-        # Skip obstacles that are too far
-        if distance > OBSTACLE_DETECTION_RANGE:
-            continue
-            
-        # Calculate inverse-square repulsive force (stronger as distance decreases)
-        force_magnitude = OBSTACLE_WEIGHT * (1.0 / max(10, distance - OBSTACLE_CRITICAL_DISTANCE)**2)
-        
-        # Convert to radians for calculation
-        angle_rad = math.radians(angle)
-        
-        # Calculate repulsive vector components (opposite direction from obstacle)
-        repulsive_x -= force_magnitude * math.cos(angle_rad)
-        repulsive_y -= force_magnitude * math.sin(angle_rad)
-    
-    return repulsive_x, repulsive_y
+# Motor speed parameters
+NORMAL_SPEED = 30     # Normal speed
+SLOW_SPEED = NORMAL_SPEED // 6  # Slow rotation speed
+TURNING_SPEED = NORMAL_SPEED // 4  # Normal turning speed
+DRIFT_BOOST = int(NORMAL_SPEED * 1.3)  # Drift speed
+STOP = 0
 
-# MODIFIED: Enhanced person prediction with better tracking history
-def predict_future_position(prediction_time, use_history=True):
-    """Predict future position with improved history-based tracking."""
-    global person_position_history, person_velocity, person_angular_velocity
-    
-    if use_history and len(person_position_history) >= 3:
-        # Extract history data
-        times = [t for t, _, _ in person_position_history]
-        angles = [a for _, a, _ in person_position_history]
-        distances = [d for _, _, d in person_position_history]
-        
-        # Use linear regression for more stable velocity estimates
-        if len(times) >= 3:
-            # Normalize times relative to first point
-            times_normalized = [t - times[0] for t in times]
-            
-            # Calculate distance velocity using linear regression
-            distance_coeffs = np.polyfit(times_normalized, distances, 1)
-            distance_velocity = distance_coeffs[0]  # Slope is velocity
-            
-            # Handle angle wrap-around for angular velocity calculation
-            unwrapped_angles = np.unwrap([math.radians(a) for a in angles])
-            angle_coeffs = np.polyfit(times_normalized, unwrapped_angles, 1)
-            angle_velocity = math.degrees(angle_coeffs[0])  # Convert back to degrees/sec
-            
-            # Current values
-            current_distance = distances[-1]
-            current_angle = angles[-1]
-            
-            # Predict future position
-            predicted_distance = current_distance + (distance_velocity * prediction_time)
-            predicted_angle = (current_angle + (angle_velocity * prediction_time)) % 360
-            
-            return predicted_distance, predicted_angle
-    
-    # Fallback to simpler prediction if history is insufficient
-    if uwb_distance is not None and target_angle is not None:
-        predicted_distance = uwb_distance + (person_velocity * prediction_time)
-        predicted_angle = (target_angle + (person_angular_velocity * prediction_time)) % 360
-        return predicted_distance, predicted_angle
-        
-    return None, None
+# Robot following parameters
+FOLLOW_DISTANCE = 50  # Target distance to maintain (cm)
+DISTANCE_TOLERANCE = 50  # Tolerance range (cm)
+ANGLE_TOLERANCE = 30  # Angle tolerance (degrees)
 
-# NEW: Detect obstacles from LiDAR data
-def detect_obstacles(scan_data, ignore_angle=None, ignore_tolerance=30):
-    """
-    Process LiDAR data to identify obstacles.
-    
-    Parameters:
-    - scan_data: List of (angle, distance) tuples from LiDAR
-    - ignore_angle: Angle where the person is (to avoid treating person as obstacle)
-    - ignore_tolerance: Angular width to ignore around the person
-    
-    Returns: List of detected obstacles as (angle, distance, size) tuples
-    """
-    if not scan_data:
-        return []
-    
-    # Filter to relevant field of view (in front of robot)
-    # Convert to front-centered coordinate system where 0° is front
-    centered_scan = []
-    for angle, distance in scan_data:
-        # Normalize angle to -180 to 180 range (0 = front)
-        centered_angle = (angle - 180) % 360
-        if centered_angle > 180:
-            centered_angle -= 360
-            
-        # Check if in our field of view
-        if abs(centered_angle) <= FIELD_OF_VIEW/2:
-            centered_scan.append((centered_angle, distance))
-    
-    # Sort by angle for clustering
-    centered_scan.sort(key=lambda x: x[0])
-    
-    # Cluster points to identify obstacles
-    clusters = []
-    current_cluster = []
-    
-    for i, (angle, distance) in enumerate(centered_scan):
-        # Check if this point should be ignored (person location)
-        if ignore_angle is not None:
-            # Convert person angle to same coordinate system
-            person_centered = (ignore_angle - 180) % 360
-            if person_centered > 180:
-                person_centered -= 360
-                
-            # Skip points near person
-            if abs((angle - person_centered + 180) % 360 - 180) < ignore_tolerance:
-                continue
-        
-        # Start new cluster or add to existing
-        if not current_cluster or abs(angle - current_cluster[-1][0]) < 5:
-            current_cluster.append((angle, distance))
-        else:
-            # Process completed cluster
-            if len(current_cluster) >= 3:
-                avg_angle = sum(a for a, _ in current_cluster) / len(current_cluster)
-                avg_distance = sum(d for _, d in current_cluster) / len(current_cluster)
-                cluster_size = len(current_cluster)
-                clusters.append((avg_angle, avg_distance * 100, cluster_size))  # Convert to cm
-            
-            # Start new cluster
-            current_cluster = [(angle, distance)]
-    
-    # Process last cluster
-    if len(current_cluster) >= 3:
-        avg_angle = sum(a for a, _ in current_cluster) / len(current_cluster)
-        avg_distance = sum(d for _, d in current_cluster) / len(current_cluster)
-        cluster_size = len(current_cluster)
-        clusters.append((avg_angle, avg_distance * 100, cluster_size))  # Convert to cm
-    
-    return clusters
+# LiDAR filtering parameters
+MAX_POINTS_PER_SCAN = 360  # Maximum points to process per scan
+MIN_QUALITY = 10           # Minimum quality threshold (A2M12 specific)
+SCAN_HISTORY_SIZE = 3      # Number of scans to keep for smoothing
+DISTANCE_FILTER_MAX = 5000  # Maximum valid distance in mm
+DISTANCE_FILTER_MIN = 150   # Minimum valid distance in mm
 
-# MODIFIED: Enhanced person detection with temporal tracking
-def identify_person_cluster(clusters, previous_angle=None, previous_distance=None):
-    """
-    Identify which cluster is most likely to be a person with temporal consistency.
-    
-    Parameters:
-    - clusters: List of cluster data
-    - previous_angle: Last known angle of person
-    - previous_distance: Last known distance of person
-    
-    Returns: Best person candidate or None
-    """
-    global person_tracking_id, person_tracking_confidence, last_person_detection
-    
-    if not clusters:
-        # Decrease confidence over time
-        person_tracking_confidence *= 0.9
-        return None
-    
-    person_candidates = []
-    
-    for i, cluster in enumerate(clusters):
-        # Check if cluster width is in human range
-        if HUMAN_SIZE_RANGE[0] <= cluster['width'] <= HUMAN_SIZE_RANGE[1] + PERSON_WIDTH_TOLERANCE:
-            # Basic confidence from physical properties
-            confidence = min(cluster['points'] / MIN_CLUSTER_POINTS, 1.0)
-            
-            # Add distance factor
-            distance_factor = max(0.5, 1.0 - (cluster['distance'] / 5.0))
-            score = confidence * distance_factor
-            
-            # Add temporal consistency if we have previous detection
-            if previous_angle is not None and previous_distance is not None:
-                # Calculate consistency with previous detection
-                angle_diff = min(abs((cluster['angle'] - previous_angle) % 360), 
-                                  abs((previous_angle - cluster['angle']) % 360))
-                
-                dist_diff = abs(cluster['distance'] - previous_distance)
-                
-                # More weight to angle consistency than distance (UWB is more reliable for distance)
-                if angle_diff < 30 and dist_diff < 100:
-                    consistency_bonus = 1.0 - (angle_diff / 60.0) - (dist_diff / 200.0)
-                    score += consistency_bonus
-            
-            person_candidates.append((score, i, cluster))
-    
-    # Sort by score (highest first)
-    person_candidates.sort(reverse=True, key=lambda x: x[0])
-    
-    # Return the best candidate if score passes threshold
-    if person_candidates and person_candidates[0][0] > TRACKING_CONFIDENCE_THRESHOLD:
-        best_score, best_idx, best_cluster = person_candidates[0]
-        
-        # Update tracking ID and confidence
-        person_tracking_id = best_idx
-        person_tracking_confidence = best_score
-        last_person_detection = time.time()
-        
-        return best_cluster
-    
-    # Decrease confidence if no good match
-    person_tracking_confidence *= 0.9
-    return None
+# Initialize LiDAR
+lidar = None
 
-# MODIFIED: Enhanced LiDAR scan processing with obstacle detection
-def scan_lidar():
-    """Process LiDAR scans to track people and detect obstacles."""
-    global running, target_angle, target_distance, obstacles, last_person_detection
-    
-    # Initialize smoothing values
-    smoothed_angle = None
-    smoothed_distance = None
+def initialize_lidar():
+    """Initialize the A2M12 LiDAR with proper settings."""
+    global lidar, lidar_health
     
     try:
-        lidar.connect()
-        print("LiDAR connected.")
+        if lidar is not None:
+            try:
+                lidar.stop()
+                lidar.disconnect()
+                time.sleep(0.5)
+            except:
+                pass
         
-        # Skip first few scans to allow LiDAR to stabilize
-        for _ in range(5):
-            lidar.iter_scans()
-            time.sleep(0.1)
+        logger.info(f"Initializing A2M12 LiDAR on {PORT_LIDAR} at {BAUDRATE_LIDAR} baud")
+        lidar = RPLidar(PORT_LIDAR, baudrate=BAUDRATE_LIDAR, timeout=LIDAR_TIMEOUT)
         
-        for scan in lidar.iter_scans():
-            if not running:
-                break
-                
-            if not scan:
-                continue
-                
-            # Prepare scan data
-            scan_data = []
-            for _, angle, distance in scan:
-                # Convert mm to meters for clustering
-                distance_m = distance / 1000.0
-                if distance_m <= 5.0:  # Limit to 5 meters
-                    scan_data.append((angle, distance_m))
-            
-            if scan_data:
-                # First, identify the person if possible
-                clusters = cluster_points(scan_data)
-                
-                # Use previous detection as hint
-                previous_angle = target_angle
-                previous_distance = target_distance/10 if target_distance else None
-                
-                person = identify_person_cluster(clusters, previous_angle, previous_distance)
-                
-                if person:
-                    # Store raw angle and distance in mm
-                    raw_angle = person['angle']
-                    raw_distance = person['distance'] * 1000  # Convert back to mm
-                    
-                    # Add to smoothing buffers
-                    target_angle_buffer.append(raw_angle)
-                    target_distance_buffer.append(raw_distance)
-                    
-                    # Apply median filter
-                    filtered_angle = median_filter(target_angle_buffer)
-                    filtered_distance = median_filter(target_distance_buffer)
-                    
-                    # Apply exponential smoothing
-                    smoothed_angle = exponential_moving_average(filtered_angle, smoothed_angle, alpha=0.5)  # More responsive
-                    smoothed_distance = exponential_moving_average(filtered_distance, smoothed_distance, alpha=0.5)
-                    
-                    # Update global values
-                    target_angle = smoothed_angle
-                    target_distance = smoothed_distance
-                    
-                    # Add to tracking history
-                    person_position_history.append((time.time(), target_angle, target_distance/10))
-                    
-                    # Update velocity estimates
-                    update_velocity_estimates()
-                    
-                    direction = get_direction_name(target_angle)
-                    confidence = person['points']
-                    print(f"LiDAR Target: {direction} at angle={target_angle:.2f}°, distance={target_distance/10:.2f}cm (confidence: {confidence})")
-                
-                # Next, detect obstacles (excluding person location)
-                person_angle = target_angle if target_angle is not None else None
-                obstacles = detect_obstacles(scan_data, ignore_angle=person_angle)
-                
-                # Log obstacles if any are close
-                close_obstacles = [o for o in obstacles if o[1] < OBSTACLE_DETECTION_RANGE]
-                if close_obstacles:
-                    print(f"Detected {len(close_obstacles)} obstacles within {OBSTACLE_DETECTION_RANGE}cm")
-            
-            time.sleep(0.05)
-            
+        # Check info and health
+        info = lidar.get_info()
+        health = lidar.get_health()
+        
+        logger.info(f"A2M12 LiDAR info: {info}")
+        logger.info(f"A2M12 LiDAR health: {health}")
+        
+        with data_lock:
+            lidar_health["connected"] = True
+            lidar_health["error_count"] = 0
+            lidar_health["last_scan_time"] = time.time()
+        
+        # Reset motor speed to ensure proper scan rate
+        lidar.motor_speed = 0  # First reset
+        time.sleep(0.1)
+        lidar.motor_speed = 660  # Set to standard A2M12 RPM
+        time.sleep(1.0)  # Allow motor to stabilize
+        
+        return True
+    
     except Exception as e:
-        print(f"LiDAR Error: {e}")
-    finally:
-        if running:  # Only stop if we're still running (avoid double-stop)
-            lidar.stop()
-            print("LiDAR stopped.")
+        logger.error(f"LiDAR initialization error: {e}")
+        with data_lock:
+            lidar_health["connected"] = False
+            lidar_health["error_count"] += 1
+        
+        return False
 
-# MODIFIED: Enhanced movement function with obstacle avoidance
-def move_robot(forward_speed, rotation_speed, ramp=True, avoid_obstacles=True):
-    """Controls robot movement with obstacle avoidance."""
-    # Static variables to track current speeds
-    if not hasattr(move_robot, "current_speeds"):
-        move_robot.current_speeds = [0, 0]  # [forward, rotation]
+def correct_bias(raw_distance, bias):
+    """Corrects bias in UWB sensor readings."""
+    return raw_distance - bias
+
+def calculate_rotation(target_angle, current_angle):
+    """Calculates required rotation to face target."""
+    angle_diff = target_angle - current_angle
     
-    # Apply obstacle avoidance if enabled
-    if avoid_obstacles and obstacles:
-        # Calculate avoidance vector
-        avoid_x, avoid_y = calculate_obstacle_avoidance_vector()
+    if angle_diff > 180:
+        angle_diff -= 360
+    elif angle_diff < -180:
+        angle_diff += 360
         
-        # Check if any obstacles are critically close
-        critical_obstacles = [o for o in obstacles if o[1] < OBSTACLE_CRITICAL_DISTANCE]
-        
-        if critical_obstacles:
-            # Emergency avoidance - override forward command if obstacle directly ahead
-            ahead_obstacles = [o for o in critical_obstacles if abs(o[0]) < 30]
-            if ahead_obstacles:
-                print("CRITICAL OBSTACLE AHEAD! Stopping forward motion")
-                forward_speed = min(0, forward_speed)  # Allow backward but not forward
-        
-        # Convert avoidance vector to speed adjustments
-        if abs(avoid_x) > 0.01 or abs(avoid_y) > 0.01:
-            # Calculate magnitude of avoidance
-            magnitude = math.sqrt(avoid_x**2 + avoid_y**2)
-            
-            # Normalize and scale the avoidance effect
-            avoid_scale = min(1.0, magnitude * 2)  # Limit maximum effect
-            
-            # Apply to forward speed (y component)
-            forward_adjustment = -avoid_y * 100 * avoid_scale
-            forward_speed += forward_adjustment
-            
-            # Apply to rotation (x component)
-            rotation_adjustment = -avoid_x * 100 * avoid_scale
-            rotation_speed += rotation_adjustment
-            
-            print(f"Obstacle avoidance: forward adj={forward_adjustment:.1f}, rotation adj={rotation_adjustment:.1f}")
+    return angle_diff
+
+def get_direction_name(angle):
+    """Convert angle to human-readable direction."""
+    directions = ["Front", "Front-Right", "Right", "Back-Right", 
+                 "Back", "Back-Left", "Left", "Front-Left"]
     
-    # Apply ramping if enabled
-    if ramp:
-        # Limit change in forward speed
-        speed_diff = forward_speed - move_robot.current_speeds[0]
-        if abs(speed_diff) > MAX_ACCELERATION:
-            forward_speed = move_robot.current_speeds[0] + MAX_ACCELERATION * (1 if speed_diff > 0 else -1)
-        
-        # Limit change in rotation speed
-        rot_diff = rotation_speed - move_robot.current_speeds[1]
-        if abs(rot_diff) > MAX_ACCELERATION:
-            rotation_speed = move_robot.current_speeds[1] + MAX_ACCELERATION * (1 if rot_diff > 0 else -1)
+    # Normalize angle to 0-360
+    normalized_angle = angle % 360
     
-    # Update current speeds
-    move_robot.current_speeds[0] = forward_speed
-    move_robot.current_speeds[1] = rotation_speed
+    # Convert to direction index (8 directions)
+    index = round(normalized_angle / 45) % 8
     
-    # Calculate wheel speeds with improved differential drive model
-    rotation_gain = 1.2  # Increase rotation response
+    return directions[index]
+
+def move_robot(forward_speed, rotation_speed):
+    """
+    Controls robot movement using differential drive.
     
-    right_speed = forward_speed - (rotation_speed * rotation_gain)
-    left_speed = forward_speed + (rotation_speed * rotation_gain)
-    
-    # Balance speeds if they exceed maximum
-    max_speed = max(abs(right_speed), abs(left_speed))
-    if max_speed > 100:
-        right_speed = right_speed * 100 / max_speed
-        left_speed = left_speed * 100 / max_speed
+    Parameters:
+    - forward_speed: Speed for forward/backward movement (-100 to 100)
+    - rotation_speed: Speed for rotation (-100 to 100)
+    """
+    right_speed = forward_speed - rotation_speed
+    left_speed = forward_speed + rotation_speed
     
     # Clamp speeds to valid range
     right_speed = max(min(right_speed, 100), -100)
@@ -452,165 +183,621 @@ def move_robot(forward_speed, rotation_speed, ramp=True, avoid_obstacles=True):
     elif rotation_speed < -5:
         movement_desc += " + Rotating Right"
     
-    print(f"Movement: {movement_desc} (R={-right_speed:.1f}, L={left_speed:.1f})")
+    logger.debug(f"Movement: {movement_desc} (R={-right_speed:.1f}, L={left_speed:.1f})")
 
-# MODIFIED: Enhanced person following with obstacle avoidance
-def follow_person():
-    """Autonomous control logic with obstacle avoidance."""
-    global running, uwb_distance, target_angle, target_distance, autonomous_mode
-    global last_update_time, last_person_detection
+def read_uwb_data():
+    """Reads data from UWB sensor."""
+    global uwb_distance, running
     
-    # Reset PID controllers
-    reset_pid_controllers()
+    try:
+        ser = serial.Serial(PORT_UWB, BAUDRATE_UWB, timeout=TIMEOUT_UWB)
+        logger.info(f"Connected to UWB sensor at {PORT_UWB}")
+        
+        while running:
+            if ser.in_waiting > 0:
+                data = ser.readline().decode("utf-8", errors='replace').strip()
+                
+                if data.startswith("$KT0"):
+                    parts = data.split(",")
+                    if len(parts) >= 4:
+                        raw_values = parts[1:4]
+                        processed_values = []
+                        
+                        for value in raw_values:
+                            if value.lower() == "null":
+                                processed_values.append(0.0)
+                            else:
+                                try:
+                                    processed_values.append(float(value))
+                                except ValueError:
+                                    processed_values.append(0.0)
+                                
+                        A0, A1, A2 = processed_values
+                        
+                        # Apply bias correction
+                        cal_A0 = correct_bias(A0*100, 100)  # Convert to cm and correct bias
+                        
+                        with data_lock:
+                            global uwb_distance
+                            uwb_distance = cal_A0
+                        
+                        logger.debug(f"UWB Distance: {cal_A0:.2f} cm")
+            
+            time.sleep(0.05)
+            
+    except serial.SerialException as e:
+        logger.error(f"UWB Error: {e}")
+    finally:
+        if 'ser' in locals() and ser.is_open:
+            ser.close()
+            logger.info("UWB serial connection closed.")
+
+def filter_lidar_data(scan_data):
+    """
+    Filter and process LiDAR scan data for the A2M12.
+    Returns filtered angles and distances.
+    """
+    filtered_angles = []
+    filtered_distances = []
     
-    last_command_time = time.time()
-    stop_count = 0  # Counter for continuous stop commands
+    # First pass: basic filtering
+    for quality, angle, distance in scan_data:
+        # Apply A2M12-specific filtering
+        if (quality >= MIN_QUALITY and 
+            DISTANCE_FILTER_MIN <= distance <= DISTANCE_FILTER_MAX):
+            filtered_angles.append(angle)
+            filtered_distances.append(distance)
+    
+    # If we have too many points, sample them
+    if len(filtered_angles) > MAX_POINTS_PER_SCAN:
+        indices = np.linspace(0, len(filtered_angles)-1, MAX_POINTS_PER_SCAN, dtype=int)
+        filtered_angles = [filtered_angles[i] for i in indices]
+        filtered_distances = [filtered_distances[i] for i in indices]
+    
+    return filtered_angles, filtered_distances
+
+def detect_person(angles, distances):
+    """
+    Advanced algorithm to detect a person from LiDAR data.
+    Returns the angle and distance to the detected person.
+    """
+    if not angles or not distances:
+        return None, None
+    
+    # Convert to numpy arrays for easier processing
+    angles_array = np.array(angles)
+    distances_array = np.array(distances)
+    
+    # Typical human width at different distances (simplified)
+    # At 1m, a human might be ~30-40° wide in scan data
+    min_cluster_size = 3  # Minimum points to consider as a potential person
+    max_point_distance = 300  # Maximum distance between points in a cluster (mm)
+    
+    # Find potential clusters (groups of points close together)
+    clusters = []
+    current_cluster = []
+    
+    # Sort points by angle for clustering
+    sorted_indices = np.argsort(angles_array)
+    sorted_angles = angles_array[sorted_indices]
+    sorted_distances = distances_array[sorted_indices]
+    
+    # Use clustering to detect person-sized objects
+    for i in range(len(sorted_angles)):
+        if not current_cluster:
+            current_cluster = [(sorted_angles[i], sorted_distances[i])]
+        else:
+            last_angle, last_distance = current_cluster[-1]
+            
+            # Check if this point is close to the last point
+            # Using both angular and distance proximity
+            angle_diff = min(abs(sorted_angles[i] - last_angle), 
+                            360 - abs(sorted_angles[i] - last_angle))
+            
+            # Points are close if they're within a certain angle and distance range
+            if ((angle_diff < 10 and abs(sorted_distances[i] - last_distance) < max_point_distance) or
+                (angle_diff < 5)):
+                current_cluster.append((sorted_angles[i], sorted_distances[i]))
+            else:
+                # End of cluster, check if it's large enough
+                if len(current_cluster) >= min_cluster_size:
+                    clusters.append(current_cluster)
+                # Start a new cluster
+                current_cluster = [(sorted_angles[i], sorted_distances[i])]
+    
+    # Check the last cluster
+    if len(current_cluster) >= min_cluster_size:
+        clusters.append(current_cluster)
+    
+    # No person-like clusters found
+    if not clusters:
+        return None, None
+    
+    # Select the most person-like cluster (closest and of reasonable size)
+    best_cluster = None
+    best_score = float('inf')  # Lower is better
+    
+    for cluster in clusters:
+        # Calculate cluster properties
+        cluster_size = len(cluster)
+        avg_distance = sum(point[1] for point in cluster) / cluster_size
+        
+        # Score: prioritize closer clusters with more points
+        score = avg_distance / (cluster_size ** 0.5)  # Square root to reduce over-emphasis on size
+        
+        if score < best_score:
+            best_score = score
+            best_cluster = cluster
+    
+    # Calculate the center of the best cluster
+    if best_cluster:
+        avg_angle = sum(point[0] for point in best_cluster) / len(best_cluster)
+        avg_distance = sum(point[1] for point in best_cluster) / len(best_cluster)
+        return avg_angle, avg_distance
+    
+    return None, None
+
+def update_lidar():
+    """Updates LiDAR data continuously for A2M12."""
+    global running, angles, distances, colors, target_angle, target_distance, lidar_health
+    
+    scan_history = []  # For temporal smoothing
+    last_error_time = 0
+    reconnect_cooldown = 5  # Seconds between reconnection attempts
+    
+    # Initialize LiDAR
+    if not initialize_lidar():
+        logger.error("Failed to initialize A2M12 LiDAR")
+        with data_lock:
+            lidar_health["connected"] = False
     
     try:
         while running:
-            current_time = time.time()
-            dt = current_time - last_update_time
-            last_update_time = current_time
+            try:
+                # Check if LiDAR needs reconnection
+                with data_lock:
+                    connected = lidar_health["connected"]
+                    last_scan = lidar_health["last_scan_time"]
+                
+                if not connected and time.time() - last_error_time > reconnect_cooldown:
+                    logger.info("Attempting to reconnect A2M12 LiDAR...")
+                    if initialize_lidar():
+                        logger.info("A2M12 LiDAR reconnected successfully")
+                    else:
+                        last_error_time = time.time()
+                        time.sleep(1)
+                        continue
+                
+                # Check for stale data
+                if time.time() - last_scan > 5:  # No scans for 5 seconds
+                    logger.warning("LiDAR data is stale, attempting to restart...")
+                    initialize_lidar()
+                    time.sleep(1)
+                    continue
+                
+                # Get a single scan (optimized for A2M12)
+                with lidar_lock:
+                    scan = list(next(lidar.iter_scans()))
+                
+                with data_lock:
+                    lidar_health["last_scan_time"] = time.time()
+                    lidar_health["connected"] = True
+                
+                # Process and filter scan data
+                filtered_angles, filtered_distances = filter_lidar_data(scan)
+                
+                # Add to history for temporal smoothing
+                scan_history.append((filtered_angles, filtered_distances))
+                if len(scan_history) > SCAN_HISTORY_SIZE:
+                    scan_history.pop(0)
+                
+                # Detect person from filtered data
+                person_angle, person_distance = detect_person(filtered_angles, filtered_distances)
+                
+                # Update global target if person detected
+                if person_angle is not None and person_distance is not None:
+                    with data_lock:
+                        target_angle = person_angle
+                        target_distance = person_distance
+                    
+                    direction = get_direction_name(person_angle)
+                    logger.debug(f"LiDAR Target: {direction} at angle={person_angle:.2f}°, distance={person_distance/10:.2f}cm")
+                
+                # Scan rate control - A2M12 works best with some delay between processing scans
+                time.sleep(0.05)
             
+            except RPLidarException as e:
+                logger.error(f"A2M12 LiDAR error: {e}")
+                with data_lock:
+                    lidar_health["connected"] = False
+                    lidar_health["error_count"] += 1
+                
+                last_error_time = time.time()
+                
+                # Try to recover
+                try:
+                    with lidar_lock:
+                        lidar.stop()
+                        time.sleep(0.5)
+                except:
+                    pass
+                
+                time.sleep(1)  # Cool-down before retry
+            
+            except StopIteration:
+                logger.warning("A2M12 LiDAR scan iteration ended, restarting...")
+                initialize_lidar()
+                time.sleep(0.5)
+            
+            except Exception as e:
+                logger.error(f"Unexpected A2M12 LiDAR error: {e}")
+                last_error_time = time.time()
+                time.sleep(1)
+    
+    except KeyboardInterrupt:
+        logger.info("LiDAR operation stopped by user.")
+    finally:
+        if running:  # Only stop if we're still running (avoid double-stop)
+            try:
+                with lidar_lock:
+                    lidar.stop()
+                    lidar.disconnect()
+                logger.info("A2M12 LiDAR stopped and disconnected.")
+            except:
+                pass
+
+def follow_person():
+    """Autonomous control logic to follow a person."""
+    global running, uwb_distance, target_angle, target_distance, autonomous_mode
+    
+    try:
+        while running:
             # Skip if in manual mode
             if not autonomous_mode:
                 time.sleep(0.1)
                 continue
+                
+            # Get the latest data thread-safely
+            with data_lock:
+                curr_uwb_distance = uwb_distance
+                curr_target_angle = target_angle
+                curr_target_distance = target_distance
             
-            # Check if we've lost track of the person
-            person_lost = (current_time - last_person_detection) > TRACKING_TIMEOUT
+            if curr_uwb_distance is None or curr_target_angle is None:
+                # No sensor data yet, wait
+                time.sleep(0.1)
+                continue
+                
+            # Default to stopped
+            forward_command = 0
+            rotation_command = 0
             
-            # Skip if no sensor data or person is lost
-            if (uwb_distance is None and target_angle is None) or person_lost:
-                if person_lost:
-                    print("Warning: Person tracking lost! Stopping robot.")
-                    move_robot(0, 0, ramp=True)
+            # Determine rotation command (based on LiDAR angle)
+            if curr_target_angle is not None:
+                angle_error = calculate_rotation(curr_target_angle, 0)  # Assuming 0 is forward
+                
+                direction = get_direction_name(curr_target_angle)
+                
+                if abs(angle_error) > ANGLE_TOLERANCE:
+                    # Need to rotate to face person
+                    # Use proportional control for smoother rotation
+                    rotation_speed = min(max(angle_error / 3, -TURNING_SPEED), TURNING_SPEED)
+                    rotation_command = rotation_speed
+                    
+                    if rotation_speed > 0:
+                        logger.debug(f"Navigation: Need to rotate LEFT to face target at {direction}")
+                    else:
+                        logger.debug(f"Navigation: Need to rotate RIGHT to face target at {direction}")
+                else:
+                    logger.debug(f"Navigation: Target angle good, facing {direction}")
+                
+            # Determine forward/backward command (based on UWB distance)
+            if curr_uwb_distance is not None:
+                distance_error = curr_uwb_distance - FOLLOW_DISTANCE
+                
+                if abs(distance_error) > DISTANCE_TOLERANCE:
+                    # Need to adjust distance - use proportional control
+                    forward_scale = 0.3  # Scale factor to smooth movement
+                    if distance_error > 0:
+                        # Too far, move forward
+                        forward_speed = min(distance_error * forward_scale, NORMAL_SPEED)
+                        forward_command = forward_speed
+                        logger.debug(f"Navigation: Moving FORWARD {distance_error:.2f}cm")
+                    else:
+                        # Too close, move backward
+                        forward_speed = max(distance_error * forward_scale, -NORMAL_SPEED)
+                        forward_command = forward_speed
+                        logger.debug(f"Navigation: Moving BACKWARD {-distance_error:.2f}cm")
+                else:
+                    logger.debug(f"Navigation: Distance good at {curr_uwb_distance:.2f}cm")
+            
+            # Execute movement with smoothing
+            move_robot(forward_command, rotation_command)
+            time.sleep(0.1)
+            
+    except KeyboardInterrupt:
+        logger.info("Follow operation stopped by user.")
+    except Exception as e:
+        logger.error(f"Follow Error: {e}")
+        # Attempt to recover without stopping program
+        time.sleep(1)
+
+def handle_manual_control():
+    """Process manual control inputs."""
+    global running, autonomous_mode
+    
+    try:
+        while running:
+            # Handle pygame events in both modes for mode switching
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_TAB:
+                        autonomous_mode = not autonomous_mode
+                        mode_str = "AUTONOMOUS" if autonomous_mode else "MANUAL"
+                        logger.info(f"Switching to {mode_str} control mode")
+                    elif event.key == pygame.K_p:
+                        running = False
+            
+            # Skip motion control if in autonomous mode
+            if autonomous_mode:
                 time.sleep(0.1)
                 continue
             
-            # Use UWB for distance if available, otherwise LiDAR
-            current_distance = uwb_distance if uwb_distance is not None else (target_distance / 10 if target_distance is not None else None)
-            current_angle = target_angle
-                
-            # If we have complete data, use prediction for smoother following
-            if current_distance is not None and current_angle is not None:
-                # Get predicted position
-                predicted_distance, predicted_angle = predict_future_position(prediction_time)
-                
-                if predicted_distance is not None and predicted_angle is not None:
-                    target_distance_for_control = predicted_distance
-                    target_angle_for_control = predicted_angle
-                else:
-                    target_distance_for_control = current_distance
-                    target_angle_for_control = current_angle
-                
-                # Default to stopped
-                forward_command = 0
-                rotation_command = 0
-                
-                # Apply PID control if we have data
-                if target_angle_for_control is not None:
-                    # Calculate rotation command with PID
-                    rotation_command = pid_angle_control(0, target_angle_for_control, dt)
-                    
-                    # Limit rotation command
-                    rotation_command = max(min(rotation_command, NORMAL_SPEED), -NORMAL_SPEED)
-                    
-                    direction = get_direction_name(target_angle_for_control)
-                    
-                    if abs(calculate_rotation(target_angle_for_control, 0)) > ANGLE_TOLERANCE:
-                        if rotation_command > 0:
-                            print(f"Navigation: Rotating LEFT to face target at {direction}")
-                        else:
-                            print(f"Navigation: Rotating RIGHT to face target at {direction}")
-                    else:
-                        print(f"Navigation: Target angle good, facing {direction}")
-                
-                # Distance control only if we're roughly facing the right direction
-                if target_distance_for_control is not None and abs(calculate_rotation(target_angle_for_control, 0)) <= ANGLE_TOLERANCE * 3:
-                    # Calculate forward command with PID
-                    dist_error = target_distance_for_control - FOLLOW_DISTANCE
-                    forward_command = pid_distance_control(target_distance_for_control, FOLLOW_DISTANCE, dt)
-                    
-                    # Limit forward command
-                    forward_command = max(min(forward_command, NORMAL_SPEED), -NORMAL_SPEED)
-                    
-                    if abs(dist_error) > DISTANCE_TOLERANCE:
-                        if dist_error > 0:
-                            print(f"Navigation: Moving FORWARD {dist_error:.2f}cm to reach target distance")
-                        else:
-                            print(f"Navigation: Moving BACKWARD {-dist_error:.2f}cm (too close)")
-                    else:
-                        print(f"Navigation: Distance good at {target_distance_for_control:.2f}cm")
-                
-                # Execute movement with obstacle avoidance
-                move_robot(forward_command, rotation_command, ramp=True, avoid_obstacles=True)
-                
-                # Reset stop counter if we're moving
-                if abs(forward_command) > 5 or abs(rotation_command) > 5:
-                    stop_count = 0
-                else:
-                    stop_count += 1
-                    
-                # If stopped for too long, send explicit stop command occasionally
-                if stop_count > 10 and stop_count % 5 == 0:
-                    move_robot(0, 0, ramp=False)
-                    print("Navigation: Sending explicit stop command")
+            # Get pressed keys
+            keys = pygame.key.get_pressed()
             
-            # Wait a bit
+            # Variable to track if we're in drift mode
+            drifting = keys[pygame.K_LSHIFT]
+            
+            # Reset speeds
+            right_speed = STOP
+            left_speed = STOP
+            
+            # ======== Combination Keys for Turning & Drift ========
+            if keys[pygame.K_w] and keys[pygame.K_a]:  # Forward + Left
+                if drifting:  # Drift mode
+                    right_speed = -DRIFT_BOOST
+                    left_speed = TURNING_SPEED
+                else:  # Normal mode
+                    right_speed = -NORMAL_SPEED
+                    left_speed = TURNING_SPEED
+            elif keys[pygame.K_w] and keys[pygame.K_d]:  # Forward + Right
+                if drifting:
+                    right_speed = -TURNING_SPEED
+                    left_speed = -DRIFT_BOOST
+                else:
+                    right_speed = -TURNING_SPEED
+                    left_speed = NORMAL_SPEED
+            elif keys[pygame.K_s] and keys[pygame.K_a]:  # Backward + Left
+                if drifting:
+                    right_speed = NORMAL_SPEED
+                    left_speed = -DRIFT_BOOST
+                else:
+                    right_speed = NORMAL_SPEED
+                    left_speed = -TURNING_SPEED
+            elif keys[pygame.K_s] and keys[pygame.K_d]:  # Backward + Right
+                if drifting:
+                    right_speed = DRIFT_BOOST
+                    left_speed = -NORMAL_SPEED
+                else:
+                    right_speed = TURNING_SPEED
+                    left_speed = -NORMAL_SPEED
+                    
+            # ======== Normal Movement Controls ========
+            elif keys[pygame.K_w]:  # Forward
+                right_speed = -NORMAL_SPEED
+                left_speed = NORMAL_SPEED
+            elif keys[pygame.K_s]:  # Backward
+                right_speed = NORMAL_SPEED
+                left_speed = -NORMAL_SPEED
+            elif keys[pygame.K_a]:  # Rotate left
+                right_speed = -SLOW_SPEED
+                left_speed = -SLOW_SPEED
+            elif keys[pygame.K_d]:  # Rotate right
+                right_speed = SLOW_SPEED
+                left_speed = SLOW_SPEED
+            elif keys[pygame.K_SPACE]:  # Fast rotation
+                right_speed = -NORMAL_SPEED
+                left_speed = -NORMAL_SPEED
+                
+            # Send commands to motors
+            right_motor.send_rpm(1, right_speed)
+            left_motor.send_rpm(1, left_speed)
+            
+            # Control loop rate
             time.sleep(0.05)
             
-    except KeyboardInterrupt:
-        print("Follow operation stopped by user.")
     except Exception as e:
-        print(f"Follow Error: {e}")
+        logger.error(f"Manual control error: {e}")
 
-# The rest of the functions remain largely unchanged...
-
-def main():
-    """Main function to run the robot."""
-    global running
+def update_ui():
+    """Updates pygame UI in both modes."""
+    global running, autonomous_mode, uwb_distance, target_angle, target_distance, lidar_health
     
     try:
-        # Set running flag
+        while running:
+            # Update display
+            screen.fill((0, 0, 0))
+            
+            # Display current mode
+            mode_text = "MODE: AUTONOMOUS FOLLOW" if autonomous_mode else "MODE: MANUAL CONTROL"
+            mode_color = (0, 255, 0) if autonomous_mode else (255, 100, 100)
+            mode_surface = font.render(mode_text, True, mode_color)
+            screen.blit(mode_surface, (20, 20))
+            
+            # Display LiDAR status
+            with data_lock:
+                connected = lidar_health["connected"]
+                error_count = lidar_health["error_count"]
+                last_scan = time.time() - lidar_health["last_scan_time"]
+            
+            lidar_status_color = (0, 255, 0) if connected and last_scan < 1 else (255, 0, 0)
+            lidar_status_text = f"A2M12 LiDAR: {'CONNECTED' if connected else 'DISCONNECTED'}"
+            lidar_status_surface = font.render(lidar_status_text, True, lidar_status_color)
+            screen.blit(lidar_status_surface, (20, 600 - 80))
+            
+            if last_scan < 60:
+                scan_time_text = f"Last scan: {last_scan:.1f}s ago (errors: {error_count})"
+                scan_time_surface = font.render(scan_time_text, True, (200, 200, 200))
+                screen.blit(scan_time_surface, (20, 600 - 50))
+            
+            # Display control instructions
+            controls = [
+                "TAB: Switch Mode",
+                "W/A/S/D: Movement (Manual)",
+                "SPACE: Fast Rotation (Manual)",
+                "SHIFT: Drift Mode (Manual)",
+                "P: Exit Program"
+            ]
+            
+            for i, control in enumerate(controls):
+                control_surface = font.render(control, True, (200, 200, 200))
+                screen.blit(control_surface, (20, 70 + i * 30))
+                
+            # Display sensor data if available
+            with data_lock:
+                curr_uwb_distance = uwb_distance
+                curr_target_angle = target_angle
+                curr_target_distance = target_distance
+                
+            if curr_uwb_distance is not None:
+                uwb_text = f"UWB Distance: {curr_uwb_distance:.2f} cm"
+                uwb_surface = font.render(uwb_text, True, (255, 200, 0))
+                screen.blit(uwb_surface, (20, 300))
+                
+            if curr_target_angle is not None and curr_target_distance is not None:
+                target_dir = get_direction_name(curr_target_angle)
+                lidar_text = f"Target: {target_dir} at {curr_target_distance/10:.2f} cm"
+                lidar_surface = font.render(lidar_text, True, (0, 255, 200))
+                screen.blit(lidar_surface, (20, 340))
+                
+                # Draw a simple visualization of target position
+                center_x, center_y = 600, 400
+                radius = 150
+                # Convert angle to radians and adjust for coordinate system
+                angle_rad = math.radians(90 - curr_target_angle)
+                # Calculate target position
+                target_x = center_x + radius * math.cos(angle_rad) 
+                target_y = center_y - radius * math.sin(angle_rad)
+                
+                # Draw circle representing robot's sensing range
+                pygame.draw.circle(screen, (50, 50, 50), (center_x, center_y), radius, 1)
+                # Draw line pointing to target
+                pygame.draw.line(screen, (0, 200, 0), (center_x, center_y), (target_x, target_y), 2)
+                # Draw robot position
+                pygame.draw.circle(screen, (200, 200, 200), (center_x, center_y), 15)
+                # Draw target position
+                pygame.draw.circle(screen, (255, 0, 0), (int(target_x), int(target_y)), 8)
+                
+                # Label directions
+                dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+                for i, d in enumerate(dirs):
+                    angle = math.radians(i * 45)
+                    dir_x = center_x + (radius + 20) * math.sin(angle)
+                    dir_y = center_y - (radius + 20) * math.cos(angle)
+                    dir_surface = font.render(d, True, (100, 100, 100))
+                    screen.blit(dir_surface, (int(dir_x), int(dir_y)))
+            
+            pygame.display.flip()
+            clock.tick(30)  # 30 FPS for UI updates
+            
+    except Exception as e:
+        logger.error(f"UI Error: {e}")
+
+def cleanup():
+    """Safely clean up resources."""
+    global lidar, running
+    
+    logger.info("Shutting down robot system...")
+    running = False
+    time.sleep(0.5)  # Allow threads to notice shutdown
+    
+    # Stop all motors
+    try:
+        right_motor.send_rpm(1, 0)
+        left_motor.send_rpm(1, 0)
+        logger.info("Motors stopped.")
+    except Exception as e:
+        logger.error(f"Error stopping motors: {e}")
+    
+    # Close LiDAR safely
+    try:
+        with lidar_lock:
+            if lidar:
+                lidar.stop()
+                lidar.disconnect()
+        logger.info("A2M12 LiDAR disconnected.")
+    except Exception as e:
+        logger.error(f"Error closing LiDAR: {e}")
+    
+    # Close pygame
+    try:
+        pygame.quit()
+    except:
+        pass
+    
+    logger.info("Cleanup complete, exiting program.")
+
+def main():
+    """Main function to run the robot system."""
+    global running, lidar
+    
+    try:
+        # Set running flag for threads
         running = True
         
-        # Create threads
-        uwb_thread = Thread(target=read_uwb_data)
-        lidar_thread = Thread(target=scan_lidar)
-        follow_thread = Thread(target=follow_person)
-        manual_thread = Thread(target=handle_manual_control)
-        vis_thread = Thread(target=update_visualization)
+        # Initialize LiDAR
+        if not initialize_lidar():
+            logger.error("Failed to initialize A2M12 LiDAR. Check connections.")
+            return
         
         # Start threads
-        uwb_thread.daemon = True
+        logger.info("Starting system threads...")
+        
+        # Start UWB reading thread
+        uwb_thread = Thread(target=read_uwb_data, daemon=True)
         uwb_thread.start()
         
-        lidar_thread.daemon = True
+        # Start LiDAR scanning thread
+        lidar_thread = Thread(target=process_lidar_data, daemon=True)
         lidar_thread.start()
         
-        follow_thread.daemon = True
+        # Start autonomous follow thread
+        follow_thread = Thread(target=follow_person, daemon=True)
         follow_thread.start()
         
-        manual_thread.daemon = True
-        manual_thread.start()
+        # Start manual control thread
+        control_thread = Thread(target=handle_manual_control, daemon=True)
+        control_thread.start()
         
-        vis_thread.daemon = True
-        vis_thread.start()
+        # Start UI update thread
+        ui_thread = Thread(target=update_ui, daemon=True)
+        ui_thread.start()
         
-        print("All systems started. Press Ctrl+C to stop.")
+        logger.info("All threads started. Press TAB to switch modes, P to exit.")
         
-        # Main loop - just keep the main thread alive
+        # Main thread monitors for keyboard interrupt
         while running:
             time.sleep(0.1)
             
     except KeyboardInterrupt:
-        print("Program stopped by user.")
+        logger.info("Program terminated by user.")
     except Exception as e:
-        print(f"Main Error: {e}")
+        logger.error(f"Unexpected error in main thread: {e}")
     finally:
-        # Cleanup
         cleanup()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.critical(f"Fatal error: {e}")
+        # Ensure motors are stopped in case of fatal error
+        try:
+            right_motor.send_rpm(1, 0)
+            left_motor.send_rpm(1, 0)
+        except:
+            pass
+
