@@ -172,90 +172,45 @@ def update_lidar():
             lidar.stop()
             print("LiDAR stopped.")
 
-# Function to follow the target autonomously
-def follow_person():
-    """Autonomous control logic to follow a person."""
-    global running, uwb_distance, target_angle, target_distance, autonomous_mode
+def read_uwb_data():
+    """Reads data from UWB sensor."""
+    global uwb_distance, running
     
     try:
+        ser = serial.Serial(PORT_UWB, BAUDRATE_UWB, timeout=TIMEOUT_UWB)
+        print(f"Connected to UWB sensor at {PORT_UWB}")
+        
         while running:
-            # Skip if in manual mode
-            if not autonomous_mode:
-                time.sleep(0.1)
-                continue
-               
-            if uwb_distance is None or target_angle is None:
-                # No sensor data yet, wait
-                time.sleep(0.1)
-                continue
+            if ser.in_waiting > 0:
+                data = ser.readline().decode("utf-8").strip()
                 
-            # Default to stopped
-            forward_command = 0
-            rotation_command = 0
-            
-            # Determine rotation command (based on LiDAR angle)
-            if target_angle is not None:
-                angle_error = calculate_rotation(target_angle, 0)  # Assuming 0 is forward
-                rotation_command = min(max(angle_error / 2, -NORMAL_SPEED), NORMAL_SPEED)
+                if data.startswith("$KT0"):
+                    parts = data.split(",")
+                    if len(parts) >= 4:
+                        raw_values = parts[1:4]
+                        processed_values = []
+                        
+                        for value in raw_values:
+                            if value.lower() == "null":
+                                processed_values.append(0.0)
+                            else:
+                                processed_values.append(float(value))
+                                                
+                        A0, A1, A2 = processed_values
+                        
+                        # Apply bias correction
+                        cal_A0 = correct_bias(A0*100, 100)  # Convert to cm and correct bias
+                        uwb_distance = cal_A0
+                        print(f"UWB Distance: {cal_A0:.2f} cm")
                 
-            # Determine forward/backward command (based on UWB distance)
-            if uwb_distance is not None:
-                distance_error = uwb_distance - FOLLOW_DISTANCE
-                if abs(distance_error) > DISTANCE_TOLERANCE:
-                    if distance_error > 0:
-                        forward_command = min(distance_error / 3, NORMAL_SPEED)
-                    else:
-                        forward_command = max(distance_error / 3, -NORMAL_SPEED)
+            time.sleep(0.05)
             
-            move_robot(forward_command, rotation_command)
-            time.sleep(0.1)
-            
-    except KeyboardInterrupt:
-        print("Follow operation stopped by user.")
-    except Exception as e:
-        print(f"Follow Error: {e}")
-
-# Function for manual control using keyboard inputs
-def handle_manual_control():
-    """Process manual control inputs."""
-    global running, autonomous_mode
-    
-    try:
-        while running:
-            # Skip if in autonomous mode
-            if autonomous_mode:
-                time.sleep(0.1)
-                continue
-            
-            # Handle pygame events
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
-                elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_TAB:
-                        autonomous_mode = not autonomous_mode
-                        mode_str = "AUTONOMOUS" if autonomous_mode else "MANUAL"
-                        print(f"Switching to {mode_str} control mode")
-            
-            keys = pygame.key.get_pressed()
-            forward_command = 0
-            rotation_command = 0
-            
-            # Move forward/backward or rotate
-            if keys[pygame.K_w]:
-                forward_command = NORMAL_SPEED
-            elif keys[pygame.K_s]:
-                forward_command = -NORMAL_SPEED
-            if keys[pygame.K_a]:
-                rotation_command = -TURNING_SPEED
-            elif keys[pygame.K_d]:
-                rotation_command = TURNING_SPEED
-            
-            move_robot(forward_command, rotation_command)
-            time.sleep(0.1)
-            
-    except Exception as e:
-        print(f"Manual control error: {e}")
+    except serial.SerialException as e:
+        print(f"UWB Error: {e}")
+    finally:
+        if 'ser' in locals() and ser.is_open:
+            ser.close()
+            print("UWB serial connection closed.")
 
 def cleanup():
     """Cleans up resources before exiting."""
