@@ -337,6 +337,115 @@ def detect_person(angles, distances):
     
     return None, None
 
+def process_lidar_data():
+    """Updates LiDAR data continuously for A2M12."""
+    global running, angles, distances, colors, target_angle, target_distance, lidar_health
+    
+    scan_history = []  # For temporal smoothing
+    last_error_time = 0
+    reconnect_cooldown = 5  # Seconds between reconnection attempts
+    
+    # Initialize LiDAR
+    if not initialize_lidar():
+        logger.error("Failed to initialize A2M12 LiDAR")
+        with data_lock:
+            lidar_health["connected"] = False
+    
+    try:
+        while running:
+            try:
+                # Check if LiDAR needs reconnection
+                with data_lock:
+                    connected = lidar_health["connected"]
+                    last_scan = lidar_health["last_scan_time"]
+                
+                if not connected and time.time() - last_error_time > reconnect_cooldown:
+                    logger.info("Attempting to reconnect A2M12 LiDAR...")
+                    if initialize_lidar():
+                        logger.info("A2M12 LiDAR reconnected successfully")
+                    else:
+                        last_error_time = time.time()
+                        time.sleep(1)
+                        continue
+                
+                # Check for stale data
+                if time.time() - last_scan > 5:  # No scans for 5 seconds
+                    logger.warning("LiDAR data is stale, attempting to restart...")
+                    initialize_lidar()
+                    time.sleep(1)
+                    continue
+                
+                # Get a single scan (optimized for A2M12)
+                with lidar_lock:
+                    scan = list(next(lidar.iter_scans()))
+                
+                with data_lock:
+                    lidar_health["last_scan_time"] = time.time()
+                    lidar_health["connected"] = True
+                
+                # Process and filter scan data
+                filtered_angles, filtered_distances = filter_lidar_data(scan)
+                
+                # Add to history for temporal smoothing
+                scan_history.append((filtered_angles, filtered_distances))
+                if len(scan_history) > SCAN_HISTORY_SIZE:
+                    scan_history.pop(0)
+                
+                # Detect person from filtered data
+                person_angle, person_distance = detect_person(filtered_angles, filtered_distances)
+                
+                # Update global target if person detected
+                if person_angle is not None and person_distance is not None:
+                    with data_lock:
+                        target_angle = person_angle
+                        target_distance = person_distance
+                    
+                    direction = get_direction_name(person_angle)
+                    logger.debug(f"LiDAR Target: {direction} at angle={person_angle:.2f}°, distance={person_distance/10:.2f}cm")
+                
+                # Scan rate control - A2M12 works best with some delay between processing scans
+                time.sleep(0.05)
+            
+            except RPLidarException as e:
+                logger.error(f"A2M12 LiDAR error: {e}")
+                with data_lock:
+                    lidar_health["connected"] = False
+                    lidar_health["error_count"] += 1
+                
+                last_error_time = time.time()
+                
+                # Try to recover
+                try:
+                    with lidar_lock:
+                        lidar.stop()
+                        time.sleep(0.5)
+                except:
+                    pass
+                
+                time.sleep(1)  # Cool-down before retry
+            
+            except StopIteration:
+                logger.warning("A2M12 LiDAR scan iteration ended, restarting...")
+                initialize_lidar()
+                time.sleep(0.5)
+            
+            except Exception as e:
+                logger.error(f"Unexpected A2M12 LiDAR error: {e}")
+                last_error_time = time.time()
+                time.sleep(1)
+    
+    except KeyboardInterrupt:
+        logger.info("LiDAR operation stopped by user.")
+    finally:
+        if running:  # Only stop if we're still running (avoid double-stop)
+            try:
+                with lidar_lock:
+                    lidar.stop()
+                    lidar.disconnect()
+                logger.info("A2M12 LiDAR stopped and disconnected.")
+            except:
+                pass
+
 def update_lidar():
     """Updates LiDAR data continuously for A2M12."""
     global running, angles, distances, colors, target_angle, target_distance, lidar_health
