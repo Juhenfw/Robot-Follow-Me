@@ -131,7 +131,7 @@ def control_lidar_and_robot():
     """
     Fungsi utama untuk mengontrol robot berdasarkan data dari UWB dan LiDAR.
     """
-    global running, thread
+    global running, thread  # Ensure the variable 'running' is declared global
     if not running:
         running = True
         thread = Thread(target=update_lidar, daemon=True)
@@ -160,6 +160,11 @@ def control_lidar_and_robot():
         lidar.stop()
 
 if __name__ == "__main__":
+    # Deklarasi global untuk 'running' dan 'thread'
+    global running
+    running = False  # Pastikan 'running' didefinisikan
+    thread = None  # Inisialisasi thread jika belum ada
+
     # Mulai membaca data UWB di thread terpisah
     uwb_thread = Thread(target=read_uwb_data, daemon=True)
     uwb_thread.start()
