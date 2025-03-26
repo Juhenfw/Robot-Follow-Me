@@ -183,7 +183,7 @@ def follow_person():
             if not autonomous_mode:
                 time.sleep(0.1)
                 continue
-                
+               
             if uwb_distance is None or target_angle is None:
                 # No sensor data yet, wait
                 time.sleep(0.1)
@@ -256,6 +256,31 @@ def handle_manual_control():
             
     except Exception as e:
         print(f"Manual control error: {e}")
+
+def cleanup():
+    """Cleans up resources before exiting."""
+    global running
+    
+    running = False
+    time.sleep(0.5)  # Allow threads to terminate
+    
+    # Stop motors
+    right_motor.send_rpm(1, 0)
+    left_motor.send_rpm(1, 0)
+    right_motor.close()
+    left_motor.close()
+    
+    # Stop LiDAR
+    try:
+        lidar.stop()
+        lidar.disconnect()
+    except:
+        pass
+    
+    # Quit pygame
+    pygame.quit()
+    
+    print("All systems stopped and disconnected.")
 
 def main():
     """Main program entry point."""
