@@ -85,9 +85,12 @@ class RobotController:
         self.stop_speed = 0
         
         # Parameter kontrol
-        self.min_follow_distance = 50  # Jarak minimum (cm) untuk berhenti
+        self.min_follow_distance = 30  # Jarak minimum (cm) untuk berhenti - diubah menjadi 30 cm
         self.max_follow_distance = 300  # Jarak maksimum (cm) untuk kecepatan penuh
         self.angle_threshold = 15  # Batas sudut (derajat) untuk gerak lurus
+        
+        # Status protokol keamanan
+        self.safety_stop_active = False
         
     def move(self, right_speed, left_speed):
         """Menggerakkan robot dengan kecepatan tertentu"""
@@ -100,16 +103,24 @@ class RobotController:
         
     def follow_target(self, angle, distance_to_target):
         """Menentukan gerakan robot berdasarkan sudut dan jarak target"""
-        # Jika target terlalu dekat, berhenti
+        # PROTOKOL KEAMANAN: Jika target terlalu dekat (kurang dari 30 cm), berhenti
         if distance_to_target < self.min_follow_distance:
-            print("Target terlalu dekat, berhenti")
+            if not self.safety_stop_active:
+                print(f"PROTOKOL KEAMANAN: Target berada dalam jarak {distance_to_target:.2f} cm (< {self.min_follow_distance} cm)")
+                print("Robot berhenti untuk keamanan")
+                self.safety_stop_active = True
             self.stop()
             return
+        else:
+            # Reset safety stop status jika robot kembali ke jarak aman
+            if self.safety_stop_active:
+                print("Target kembali ke jarak aman, robot dapat bergerak kembali")
+                self.safety_stop_active = False
             
         # Hitung faktor kecepatan berdasarkan jarak
         # Makin jauh target, makin cepat robot bergerak
         distance_factor = min(1.0, (distance_to_target - self.min_follow_distance) / 
-                              (self.max_follow_distance - self.min_follow_distance))
+                             (self.max_follow_distance - self.min_follow_distance))
         adjusted_speed = self.base_speed * distance_factor
         
         # Normalisasi sudut ke rentang 0-360
@@ -196,6 +207,7 @@ def main_robot_follower():
     robot = RobotController(r_wheel_port, l_wheel_port)
     
     print("Robot siap mengikuti target UWB T0...")
+    print(f"PROTOKOL KEAMANAN: Robot akan berhenti saat jarak target < {robot.min_follow_distance} cm")
     print("Tekan Ctrl+C untuk keluar.")
     
     try:
