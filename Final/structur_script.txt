@@ -1,0 +1,17 @@
+robot_follower/
+├── config.py             # Konfigurasi sistem
+├── sensors/
+│   ├── __init__.py
+│   ├── sensor_base.py    # Kelas dasar untuk sensor
+│   ├── lidar_sensor.py   # Implementasi LIDAR
+│   └── uwb_tracker.py    # Implementasi UWB tracker
+├── controllers/
+│   ├── __init__.py
+│   ├── robot_controller.py  # Kontrol robot
+│   └── pid_controller.py    # Implementasi PID
+├── utils/
+│   ├── __init__.py
+│   ├── logging_setup.py     # Setup logging
+│   ├── visualization.py     # Utilitas visualisasi
+│   └── safety.py            # Fitur keamanan
+└── main.py                  # Entry point
