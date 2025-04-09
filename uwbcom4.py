@@ -4,135 +4,10 @@ from scipy.optimize import minimize
 import math
 import time
 import ddsm115 as motor
-from rplidar import RPLidar
-import threading
 
-class LidarProcessor:
-    """Memproses data LIDAR untuk deteksi obstacle"""
-    def __init__(self, port='/dev/ttyUSB0'):
-        self.port = port
-        self.lidar = None
-        self.scan_data = [0] * 360  # Data scan untuk 360 derajat
-        self.obstacles_detected = False
-        self.obstacle_directions = []  # Arah di mana obstacle terdeteksi
-        self.running = False
-        self.min_distance = 0.3  # Jarak minimum aman dalam meter (30 cm)
-        
-        # Zona keamanan (dalam derajat, relatif terhadap robot)
-        self.danger_zones = {
-            'front': range(-30, 31),      # Zona depan
-            'front_right': range(31, 61), # Zona depan kanan
-            'right': range(61, 121),      # Zona kanan
-            'back_right': range(121, 151),# Zona belakang kanan
-            'back': list(range(151, 180)) + list(range(-180, -151)),  # Zona belakang
-            'back_left': range(-150, -121),  # Zona belakang kiri
-            'left': range(-120, -61),     # Zona kiri
-            'front_left': range(-60, -31) # Zona depan kiri
-        }
-        
-        self.zone_status = {zone: False for zone in self.danger_zones}
-        
-        # Thread untuk scanning lidar akan dimulai saat start() dipanggil
-        self.scan_thread = None
-
-    def start(self):
-        """Memulai proses scanning LIDAR"""
-        if self.running:
-            print("LIDAR already running")
-            return
-            
-        try:
-            # Connect dan inisialisasi LIDAR dengan baudrate yang sesuai
-            self.lidar = RPLidar(self.port, baudrate=256000)
-            self.lidar.connect()
-            self.lidar.start_motor()
-            
-            self.running = True
-            self.scan_thread = threading.Thread(target=self._scan_thread)
-            self.scan_thread.daemon = True  # Thread akan berhenti ketika program utama berhenti
-            self.scan_thread.start()
-            
-            print("LIDAR scanning dimulai.")
-        except Exception as e:
-            print(f"Error saat menginisialisasi LIDAR: {e}")
-            if self.lidar:
-                self.lidar.stop_motor()
-                self.lidar.disconnect()
-    
-    def _scan_thread(self):
-        """Thread untuk proses scanning LIDAR"""
-        try:
-            print("Memulai pengumpulan data LIDAR...")
-            for scan in self.lidar.iter_scans():
-                if not self.running:
-                    break
-                    
-                # Reset status zona untuk scan baru
-                self.zone_status = {zone: False for zone in self.danger_zones}
-                self.obstacles_detected = False
-                self.obstacle_directions = []
-                
-                for _, angle, distance in scan:
-                    # Konversi ke meter dari mm
-                    distance = distance / 1000.0
-                    
-                    # Simpan data scan
-                    angle_index = int(angle)
-                    if 0 <= angle_index < 360:
-                        self.scan_data[angle_index] = distance
-                    
-                    # Cek apakah obstacle terdeteksi
-                    if distance < self.min_distance and distance > 0.1:  # Hindari false readings yang terlalu dekat
-                        # Normalisasi sudut ke rentang (-180, 180)
-                        norm_angle = angle
-                        if norm_angle > 180:
-                            norm_angle -= 360
-                            
-                        self.obstacles_detected = True
-                        self.obstacle_directions.append(norm_angle)
-                        
-                        # Update status zona
-                        for zone, angle_range in self.danger_zones.items():
-                            if int(norm_angle) in angle_range:
-                                self.zone_status[zone] = True
-                                break
-        except Exception as e:
-            print(f"Error dalam scanning LIDAR: {e}")
-        finally:
-            # Pastikan LIDAR berhenti dengan aman jika thread berakhir
-            if self.running:
-                self.stop()
-    
-    def get_obstacle_info(self):
-        """Mendapatkan informasi obstacle dari scan LIDAR terbaru"""
-        return {
-            'obstacles_detected': self.obstacles_detected,
-            'obstacle_directions': self.obstacle_directions,
-            'zone_status': self.zone_status
-        }
-    
-    def stop(self):
-        """Menghentikan LIDAR dengan aman"""
-        self.running = False
-        print("Menghentikan LIDAR...")
-        
-        # Beri waktu thread untuk selesai dengan bersih
-        if self.scan_thread and self.scan_thread.is_alive():
-            try:
-                self.scan_thread.join(timeout=1.0)
-            except Exception:
-                pass
-        
-        # Hentikan motor dan putuskan koneksi
-        if hasattr(self, 'lidar') and self.lidar:
-            try:
-                self.lidar.stop_motor()
-                time.sleep(0.5)  # Berikan waktu untuk motor berhenti
-                self.lidar.disconnect()
-            except Exception as e:
-                print(f"Error saat menghentikan LIDAR: {e}")
-                
-        print("LIDAR dimatikan.")
+# Fixed device paths for consistent hardware connections
+RIGHT_WHEEL_PORT = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_B0049TUZ-if00-port0"
+LEFT_WHEEL_PORT = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_B0045S9B-if00-port0"
 
 class UWBTracker:
     def __init__(self, fixed_anchor_positions, initial_bias=None):
@@ -140,7 +15,6 @@ class UWBTracker:
         self.A1_pos = np.array(fixed_anchor_positions['A1'])
         self.A2_pos = np.array(fixed_anchor_positions['A2'])
         self.A0_pos = np.array(fixed_anchor_positions['A0'])  # Posisi A0 juga tetap
-        self.fixed_angle = math.radians(60)  # Sudut tetap antara anchor
         self.bias = initial_bias or {'A0': 40, 'A1': 30, 'A2': 45}
         self.scale_factor = {'A0': 1.0, 'A1': 1.0, 'A2': 1.0}
     
@@ -173,31 +47,7 @@ class UWBTracker:
         result = minimize(self.trilateration_cost, initial_guess, args=(corrected_distances, anchor_positions), method='Nelder-Mead', options={'maxiter': 100})
         diagnostics = {'raw_distances': distances, 'corrected_distances': corrected_distances, 'optimization_success': result.success, 'optimization_message': result.message}
         return result.x, diagnostics
-    
-    def calculate_angle(self, a, b, c):
-        """ Hitung sudut menggunakan hukum kosinus """
-        try:
-            cos_angle = (a**2 + b**2 - c**2) / (2 * a * b)
-            cos_angle = max(min(cos_angle, 1), -1)
-            angle = math.degrees(math.acos(cos_angle))
-            return angle
-        except Exception as e:
-            print(f"Error calculating angle: {e}")
-            return None
-    
-    def calculate_robot_angle(self, target_pos, reference_pos):
-        """ Hitung sudut robot untuk mengejar target """
-        vector_to_target = target_pos - reference_pos
-        angle = math.atan2(vector_to_target[1], vector_to_target[0])
-        return math.degrees(angle)
-    
-    def print_tracking_info(self, corrected_distances, robot_angle=None, additional_angle=None):
-        """ Cetak informasi tracking """
-        print(f"\nA0 = {corrected_distances['A0']:.2f} cm | A1 = {corrected_distances['A1']:.2f} cm | A2 = {corrected_distances['A2']:.2f} cm")
-        if robot_angle is not None:
-            print(f"Sudut Robot: {robot_angle:.2f} derajat")
-        if additional_angle is not None:
-            print(f"Sudut Tambahan: {additional_angle:.2f} derajat")
+
 
 class RobotController:
     def __init__(self, r_wheel_port, l_wheel_port):
@@ -210,22 +60,16 @@ class RobotController:
         # Parameter kecepatan
         self.base_speed = 75  # Kecepatan dasar
         self.slow_speed = self.base_speed / 2  # Kecepatan rendah
-        self.turn_speed = self.base_speed / 4  # Kecepatan belok
         self.stop_speed = 0
         
         # Parameter kontrol
         self.min_follow_distance = 30  # Jarak minimum (cm) untuk berhenti
         self.max_follow_distance = 300  # Jarak maksimum (cm) untuk kecepatan penuh
-        self.angle_threshold = 15  # Batas sudut (derajat) untuk gerak lurus
         
         # Parameter target distance
         self.target_distance = 150  # Jarak target yang diinginkan (cm)
-        self.distance_threshold = 15  # Toleransi jarak (±15 cm)
+        self.distance_threshold = 15  # Toleransi jarak (Â±15 cm)
         self.target_reached = False  # Status pencapaian target
-        
-        # Status protokol keamanan
-        self.safety_stop_active = False
-        self.obstacle_avoidance_active = False
         
     def move(self, right_speed, left_speed):
         """Menggerakkan robot dengan kecepatan tertentu"""
@@ -235,157 +79,33 @@ class RobotController:
     def stop(self):
         """Menghentikan robot"""
         self.move(self.stop_speed, self.stop_speed)
-        
-    def follow_target_with_obstacle_avoidance(self, angle, distance_to_target, obstacle_info):
-        """Menentukan gerakan robot berdasarkan sudut, jarak target, dan data obstacle"""
+
+    def follow_target(self, distance_to_target):
+        """Menentukan gerakan robot berdasarkan jarak target"""
         # PROTOKOL KEAMANAN: Jika target terlalu dekat (kurang dari 30 cm), berhenti
         if distance_to_target < self.min_follow_distance:
-            if not self.safety_stop_active:
-                print(f"PROTOKOL KEAMANAN: Target berada dalam jarak {distance_to_target:.2f} cm (< {self.min_follow_distance} cm)")
-                print("Robot berhenti untuk keamanan")
-                self.safety_stop_active = True
+            print(f"PROTOKOL KEAMANAN: Target berada dalam jarak {distance_to_target:.2f} cm (< {self.min_follow_distance} cm)")
+            print("Robot berhenti untuk keamanan")
             self.stop()
             return
-        else:
-            # Reset safety stop status jika robot kembali ke jarak aman
-            if self.safety_stop_active:
-                print("Target kembali ke jarak aman, robot dapat bergerak kembali")
-                self.safety_stop_active = False
         
         # Cek jika robot sudah mencapai jarak target
         if abs(distance_to_target - self.target_distance) <= self.distance_threshold:
-            if not self.target_reached:
-                print(f"TARGET TERCAPAI: Robot berada pada jarak {distance_to_target:.2f} cm dari target")
-                print(f"(Jarak target: {self.target_distance} ± {self.distance_threshold} cm)")
-                self.target_reached = True
+            print(f"TARGET TERCAPAI: Robot berada pada jarak {distance_to_target:.2f} cm dari target")
+            print(f"(Jarak target: {self.target_distance} Â± {self.distance_threshold} cm)")
             self.stop()
             return
-        else:
-            # Reset status jika robot bergerak menjauhi jarak target
-            if self.target_reached:
-                print(f"Robot keluar dari jarak target, melanjutkan pelacakan")
-                self.target_reached = False
         
-        # Deteksi dan hindari obstacles
-        if obstacle_info['obstacles_detected']:
-            self.obstacle_avoidance_active = True
-            print("OBSTACLE TERDETEKSI: Menjalankan protokol penghindaran")
-            
-            # Cek jenis obstacle berdasarkan zona yang diblock
-            zone_status = obstacle_info['zone_status']
-            
-            # Strategi penghindaran sederhana berdasarkan zona obstacle
-            if zone_status['front']:
-                print("Obstacle di depan: mundur dan cari jalan")
-                self.move(self.slow_speed, -self.slow_speed)  # Mundur
-                time.sleep(0.5)
-                
-                # Cek kiri atau kanan yang lebih aman
-                if zone_status['right'] or zone_status['front_right']:
-                    print("Berbelok ke kiri")
-                    self.move(-self.slow_speed, -self.turn_speed)  # Belok kiri tajam
-                else:
-                    print("Berbelok ke kanan")
-                    self.move(self.turn_speed, self.slow_speed)  # Belok kanan tajam
-                
-                return
-                
-            elif zone_status['front_right']:
-                print("Obstacle di depan kanan: belok kiri")
-                self.move(-self.slow_speed, self.turn_speed)  # Belok kiri
-                return
-                
-            elif zone_status['front_left']:
-                print("Obstacle di depan kiri: belok kanan")
-                self.move(-self.turn_speed, self.slow_speed)  # Belok kanan
-                return
-                
-            elif zone_status['right']:
-                print("Obstacle di kanan: hindari ke kiri")
-                self.move(-self.slow_speed, self.turn_speed)  # Bergerak lebih ke kiri
-                return
-                
-            elif zone_status['left']:
-                print("Obstacle di kiri: hindari ke kanan")
-                self.move(-self.turn_speed, self.slow_speed)  # Bergerak lebih ke kanan
-                return
-                
-            # Jika hanya ada obstacle di belakang, tidak perlu menghindari
-            elif zone_status['back'] and not any([zone_status['front'], zone_status['front_right'], 
-                                               zone_status['front_left'], zone_status['right'], 
-                                               zone_status['left']]):
-                print("Obstacle hanya di belakang: lanjutkan normal")
-                self.obstacle_avoidance_active = False
-            
-        else:
-            # Reset status penghindaran jika tidak ada obstacle
-            if self.obstacle_avoidance_active:
-                print("Tidak ada obstacle terdeteksi, kembali ke mode pelacakan normal")
-                self.obstacle_avoidance_active = False
+        # Hitung faktor kecepatan berdasarkan jarak
+        # Makin jauh target, makin cepat robot bergerak
+        distance_factor = min(1.0, (distance_to_target - self.min_follow_distance) / 
+                            (self.max_follow_distance - self.min_follow_distance))
+        adjusted_speed = self.base_speed * distance_factor
         
-        # Jika tidak ada obstacle yang perlu dihindari, lanjutkan mengikuti target
-        if not self.obstacle_avoidance_active:
-            # Hitung faktor kecepatan berdasarkan jarak
-            # Makin jauh target, makin cepat robot bergerak
-            distance_factor = min(1.0, (distance_to_target - self.min_follow_distance) / 
-                                (self.max_follow_distance - self.min_follow_distance))
-            adjusted_speed = self.base_speed * distance_factor
-            
-            # Normalisasi sudut ke rentang 0-360
-            norm_angle = angle % 360
-            if norm_angle > 180:
-                norm_angle -= 360
-                
-            print(f"Sudut target: {norm_angle:.2f}°, Jarak: {distance_to_target:.2f} cm, Kecepatan: {adjusted_speed:.2f}")
-            
-            # Logika pergerakan berdasarkan sudut target (menggunakan referensi diagram)
-            # Depan (-30 hingga 30 derajat)
-            if -self.angle_threshold <= norm_angle <= self.angle_threshold:
-                # Maju lurus
-                self.move(-adjusted_speed, adjusted_speed)
-                print("Bergerak maju")
-                
-            # Depan Kanan (30 hingga 60 derajat)
-            elif self.angle_threshold < norm_angle <= 60:
-                # Belok kanan ringan
-                self.move(-self.turn_speed, adjusted_speed)
-                print("Belok kanan ringan")
-                
-            # Kanan (60 hingga 120 derajat)
-            elif 60 < norm_angle <= 120:
-                # Belok kanan tajam
-                self.move(self.turn_speed, adjusted_speed)
-                print("Belok kanan tajam")
-                
-            # Belakang Kanan (120 hingga 150 derajat)
-            elif 120 < norm_angle <= 150:
-                # Belok kanan mundur
-                self.move(adjusted_speed, self.turn_speed)
-                print("Belok kanan mundur")
-                
-            # Belakang (150 hingga -150 derajat)
-            elif 150 < norm_angle or norm_angle <= -150:
-                # Mundur
-                self.move(adjusted_speed, -adjusted_speed)
-                print("Bergerak mundur")
-                
-            # Belakang Kiri (-150 hingga -120 derajat)
-            elif -150 < norm_angle <= -120:
-                # Belok kiri mundur
-                self.move(self.turn_speed, -adjusted_speed)
-                print("Belok kiri mundur")
-                
-            # Kiri (-120 hingga -60 derajat)
-            elif -120 < norm_angle <= -60:
-                # Belok kiri tajam
-                self.move(-adjusted_speed, -self.turn_speed)
-                print("Belok kiri tajam")
-                
-            # Depan Kiri (-60 hingga -30 derajat)
-            elif -60 < norm_angle < -self.angle_threshold:
-                # Belok kiri ringan
-                self.move(-adjusted_speed, self.turn_speed)
-                print("Belok kiri ringan")
+        # Bergerak maju
+        self.move(-adjusted_speed, adjusted_speed)
+        print(f"Bergerak maju dengan kecepatan: {adjusted_speed:.2f}")
+
     
     def close(self):
         """Menutup koneksi motor"""
@@ -394,19 +114,15 @@ class RobotController:
         self.left_motor.close()
         
 def main_robot_follower():
-    # Konfigurasi port serial untuk motor
-    r_wheel_port = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_B0049TUZ-if00-port0"
-    l_wheel_port = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_B0045S9B-if00-port0"
+    # Gunakan konstanta port yang sudah didefinisikan
+    r_wheel_port = RIGHT_WHEEL_PORT
+    l_wheel_port = LEFT_WHEEL_PORT
     
     # Inisialisasi socket UDP
     UDP_IP = "192.168.80.113"  # IP Raspberry Pi 2 (penerima)
     UDP_PORT = 5005
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
-    
-    # Inisialisasi LIDAR dengan port yang benar dari second code
-    lidar_port = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_f235ae4105e1d247940e6441b646a0b3-if00-port0"
-    lidar_processor = LidarProcessor(port=lidar_port)
     
     # Inisialisasi tracker UWB
     tracker = UWBTracker({
@@ -417,21 +133,9 @@ def main_robot_follower():
     
     # Inisialisasi robot controller
     robot = RobotController(r_wheel_port, l_wheel_port)
-    # Konfigurasi jarak target (TAMBAHKAN INI jika ingin mengubah nilai default)
-    robot.target_distance = 150  # Jarak target dalam cm
-    robot.distance_threshold = 15  # Toleransi +-15 cm
     
-    print("Inisialisasi LIDAR...")
-    try:
-        lidar_processor.start()
-        time.sleep(2)  # Berikan waktu untuk LIDAR startup
-    except Exception as e:
-        print(f"Error inisialisasi LIDAR: {e}")
-        return
-    
-    print("Robot siap mengikuti target UWB T0 dengan menghindari obstacle...")
+    print("Robot siap mengikuti target UWB T0...")
     print(f"PROTOKOL KEAMANAN: Robot akan berhenti saat jarak target < {robot.min_follow_distance} cm")
-    print("PROTOKOL OBSTACLE: Robot akan menghindari obstacle yang terdeteksi oleh LIDAR")
     print("Tekan Ctrl+C untuk keluar.")
     
     try:
@@ -444,12 +148,6 @@ def main_robot_follower():
                     print(f"Data diterima dari {addr}: {data.decode()}")
                 except socket.timeout:
                     continue
-                
-                # Dapatkan informasi obstacle dari LIDAR
-                obstacle_info = lidar_processor.get_obstacle_info()
-                if obstacle_info['obstacles_detected']:
-                    direction_str = ', '.join([f"{d:.1f}°" for d in obstacle_info['obstacle_directions'][:5]])
-                    print(f"Obstacle terdeteksi pada arah: {direction_str}...")
                 
                 # Proses data UWB
                 parts = data.decode().split(",")
@@ -482,36 +180,11 @@ def main_robot_follower():
                         anchor_positions
                     )
                     
-                    # Hitung sudut robot ke target
-                    robot_angle = tracker.calculate_robot_angle(
-                        target_pos,
-                        anchor_positions['A0']
-                    )
-                    
-                    # Hitung sudut tambahan (hukum kosinus)
-                    additional_angle = tracker.calculate_angle(
-                        corrected_distances['A0'],
-                        corrected_distances['A1'],
-                        corrected_distances['A2']
-                    )
-                    
-                    # Cetak informasi tracking
-                    tracker.print_tracking_info(
-                        corrected_distances,
-                        robot_angle,
-                        additional_angle
-                    )
-                    
-                    # Cetak informasi tambahan
-                    print("Diagnostik:")
-                    print(f"Estimasi Posisi Target: {target_pos}")
-                    print(f"Status Optimasi: {diagnostics['optimization_success']}")
-                    
                     # Hitung jarak ke target dari A0 (pusat robot)
                     distance_to_target = corrected_distances['A0']
                     
-                    # Kontrol robot berdasarkan data tracking dan obstacle avoidance
-                    robot.follow_target_with_obstacle_avoidance(robot_angle, distance_to_target, obstacle_info)
+                    # Kontrol robot berdasarkan data tracking
+                    robot.follow_target(distance_to_target)
                     
             except Exception as e:
                 print(f"Error memproses data: {e}")
@@ -523,10 +196,9 @@ def main_robot_follower():
     finally:
         # Bersihkan koneksi
         print("Membersihkan dan menutup semua koneksi...")
-        lidar_processor.stop()
         robot.close()
         sock.close()
-        print("Koneksi LIDAR, socket, dan motor ditutup.")
+        print("Koneksi socket dan motor ditutup.")
 
 if __name__ == "__main__":
     main_robot_follower()
