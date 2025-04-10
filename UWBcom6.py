@@ -7,6 +7,34 @@ from rplidar import RPLidar
 import threading
 
 
+class UWBTracker:
+    """Handles UWB data processing and position estimation"""
+    
+    def __init__(self):
+        # Default bias correction values
+        self.bias = {
+            'A0': 10.0,  # Example bias value in cm
+            'A1': 8.0,   # Example bias value in cm
+            'A2': 12.0   # Example bias value in cm
+        }
+        
+        # Default scale factor values
+        self.scale_factor = {
+            'A0': 1.05,  # Example scale factor
+            'A1': 0.98,  # Example scale factor
+            'A2': 1.02   # Example scale factor
+        }
+    
+    def apply_bias_correction(self, distances):
+        """Koreksi bias dan scaling pada pengukuran jarak"""
+        corrected_distances = {
+            'A0': max((distances['A0'] * 100 * self.scale_factor['A0']) - self.bias['A0'], 0),
+            'A1': max((distances['A1'] * 100 * self.scale_factor['A1']) - self.bias['A1'], 0),
+            'A2': max((distances['A2'] * 100 * self.scale_factor['A2']) - self.bias['A2'], 0)
+        }
+        return corrected_distances
+
+
 class LidarProcessor:
     """Processes LIDAR data for obstacle detection"""
     
@@ -76,7 +104,7 @@ class RobotController:
         A0, A1, A2 = distances['A0'], distances['A1'], distances['A2']
         
         # Print current distance values
-        print("UWB Distances (cm):")
+        print("UWB Corrected Distances (cm):")
         print(f"A0: {A0:.2f} | A1: {A1:.2f} | A2: {A2:.2f}")
 
         if A0 < A1 and A0 < A2:
@@ -107,9 +135,12 @@ def main_robot_loop():
     sock.bind((UDP_IP, UDP_PORT))
 
     # Initialize UWB distances
-    uwb_distances = {'A0': 1000, 'A1': 1000, 'A2': 1000}
-    print("Initial UWB distances:", uwb_distances)
+    raw_uwb_distances = {'A0': 1000, 'A1': 1000, 'A2': 1000}
+    print("Initial UWB distances:", raw_uwb_distances)
 
+    # Initialize UWB tracker with bias correction
+    uwb_tracker = UWBTracker()
+    
     # Initialize robot controller
     robot = RobotController(r_wheel_port, l_wheel_port)
 
@@ -124,17 +155,21 @@ def main_robot_loop():
             data, addr = sock.recvfrom(1024)
             parts = data.decode().split(",")
             
-            # Update distances and print received values
-            uwb_distances['A0'] = float(parts[0])
-            uwb_distances['A1'] = float(parts[1])
-            uwb_distances['A2'] = float(parts[2])
+            # Update raw distances
+            raw_uwb_distances['A0'] = float(parts[0])
+            raw_uwb_distances['A1'] = float(parts[1])
+            raw_uwb_distances['A2'] = float(parts[2])
             
             print("\n--- New UWB Data Received ---")
             print(f"Raw data: {data.decode()}")
-            print(f"A0: {uwb_distances['A0']}, A1: {uwb_distances['A1']}, A2: {uwb_distances['A2']}")
+            print(f"Raw distances - A0: {raw_uwb_distances['A0']}, A1: {raw_uwb_distances['A1']}, A2: {raw_uwb_distances['A2']}")
+            
+            # Apply bias correction
+            corrected_distances = uwb_tracker.apply_bias_correction(raw_uwb_distances)
+            print(f"Corrected distances - A0: {corrected_distances['A0']:.2f}, A1: {corrected_distances['A1']:.2f}, A2: {corrected_distances['A2']:.2f}")
 
-            # Analyze and act based on UWB distances
-            robot.analyze_and_act(uwb_distances)
+            # Analyze and act based on corrected UWB distances
+            robot.analyze_and_act(corrected_distances)
             time.sleep(0.1)
 
     except KeyboardInterrupt:
