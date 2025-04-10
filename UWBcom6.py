@@ -74,20 +74,26 @@ class RobotController:
             Jarak A2 < (A0 & A1): Robot rotates left
         """
         A0, A1, A2 = distances['A0'], distances['A1'], distances['A2']
+        
+        # Print current distance values
+        print("UWB Distances (cm):")
+        print(f"A0: {A0:.2f} | A1: {A1:.2f} | A2: {A2:.2f}")
 
         if A0 < A1 and A0 < A2:
-            print("Move Forward")
+            print("Move Forward - A0 is closest")
             self.move(100, 100)  # Move forward with equal speed
         elif A1 < A0 and A1 < A2:
-            print("Rotate Right")
+            print("Rotate Right - A1 is closest")
             self.move(100, -100)  # Right rotation
         elif A2 < A0 and A2 < A1:
-            print("Rotate Left")
+            print("Rotate Left - A2 is closest")
             self.move(-100, 100)  # Left rotation
+        else:
+            print("Maintaining current movement - No clear direction")
 
         # Stop when A0 distance reaches the threshold of 150 cm
         if A0 <= 150:
-            print("Stopping as target reached.")
+            print("Stopping as target reached (A0 <= 150 cm)")
             self.stop()
 
 
@@ -102,6 +108,7 @@ def main_robot_loop():
 
     # Initialize UWB distances
     uwb_distances = {'A0': 1000, 'A1': 1000, 'A2': 1000}
+    print("Initial UWB distances:", uwb_distances)
 
     # Initialize robot controller
     robot = RobotController(r_wheel_port, l_wheel_port)
@@ -116,9 +123,15 @@ def main_robot_loop():
             # Receive UWB distance data
             data, addr = sock.recvfrom(1024)
             parts = data.decode().split(",")
+            
+            # Update distances and print received values
             uwb_distances['A0'] = float(parts[0])
             uwb_distances['A1'] = float(parts[1])
             uwb_distances['A2'] = float(parts[2])
+            
+            print("\n--- New UWB Data Received ---")
+            print(f"Raw data: {data.decode()}")
+            print(f"A0: {uwb_distances['A0']}, A1: {uwb_distances['A1']}, A2: {uwb_distances['A2']}")
 
             # Analyze and act based on UWB distances
             robot.analyze_and_act(uwb_distances)
@@ -130,6 +143,7 @@ def main_robot_loop():
         lidar_processor.stop()
         robot.stop()
         sock.close()
+        print("All systems shut down.")
 
 
 if __name__ == "__main__":
