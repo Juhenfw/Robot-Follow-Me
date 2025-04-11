@@ -3,89 +3,47 @@ import serial
 import time
 import numpy as np
 from collections import deque
-import math
 
-class KalmanFilter:
-    def __init__(self, process_variance=0.01, measurement_variance=0.1, initial_value=0):
-        self.process_variance = process_variance  # Uncertainty in the system
-        self.measurement_variance = measurement_variance  # Uncertainty in measurements
-        self.estimate = initial_value  # Initial state
-        self.estimate_error = 1.0  # Initial error estimate
+class AdaptiveKalmanFilter:
+    def __init__(self, process_variance=0.125, measurement_variance=0.5, initial_value=0):
+        self.process_variance = process_variance  # Diperbesar untuk responsif terhadap perubahan
+        self.measurement_variance = measurement_variance
+        self.estimate = initial_value
+        self.estimate_error = 1.0
+        self.last_measurement = initial_value
+        self.movement_detected = False
         
-    def update(self, measurement):
+    def update(self, measurement, force_update=False):
+        # Deteksi pergerakan
+        movement = abs(measurement - self.last_measurement) > 0.1
+        self.movement_detected = movement
+        
+        # Saat pergerakan terdeteksi, tingkatkan responsivitas
+        if movement or force_update:
+            proc_variance = self.process_variance * 3.0  # Lebih responsif
+            meas_variance = self.measurement_variance * 0.5  # Lebih mempercayai pengukuran
+        else:
+            proc_variance = self.process_variance
+            meas_variance = self.measurement_variance
+            
         # Prediction update
-        prediction_error = self.estimate_error + self.process_variance
+        prediction_error = self.estimate_error + proc_variance
         
         # Measurement update
-        kalman_gain = prediction_error / (prediction_error + self.measurement_variance)
+        kalman_gain = prediction_error / (prediction_error + meas_variance)
         self.estimate = self.estimate + kalman_gain * (measurement - self.estimate)
         self.estimate_error = (1 - kalman_gain) * prediction_error
         
+        self.last_measurement = measurement
         return self.estimate
 
 def median_filter(data, window_size):
     """Apply median filter to remove outliers"""
     if len(data) == 0:
         return 0.0
-    return np.median(data)
-
-def exponential_weighted_moving_average(data, alpha=0.2):
-    """Apply EWMA to smooth data with more weight on recent values"""
-    if len(data) == 0:
-        return 0.0
-    result = data[0]
-    for i in range(1, len(data)):
-        result = alpha * data[i] + (1 - alpha) * result
-    return result
-
-def detect_outliers(value, history, threshold_multiplier=2.0):
-    """Detect if a value is an outlier based on historical data"""
-    if len(history) < 3:
-        return False  # Not enough history to determine outliers
-    
-    # Calculate median and MAD (Median Absolute Deviation)
-    median_val = np.median(history)
-    mad = np.median([abs(x - median_val) for x in history])
-    
-    # MAD is more robust to outliers than standard deviation
-    if mad == 0:  # Avoid division by zero
-        mad = 0.00001
-    
-    # Check if the value is an outlier using modified Z-score
-    modified_z_score = 0.6745 * abs(value - median_val) / mad
-    
-    return modified_z_score > threshold_multiplier
-
-def constrain_by_physics(value, prev_value, max_change=0.5, time_delta=0.1):
-    """Constrain values based on physical limitations (max possible change per time)"""
-    if prev_value is None:
-        return value
-    
-    max_possible_change = max_change * time_delta  # Maximum change possible in this time frame
-    
-    if abs(value - prev_value) > max_possible_change:
-        # Limit the change to what's physically possible
-        if value > prev_value:
-            return prev_value + max_possible_change
-        else:
-            return prev_value - max_possible_change
-    
-    return value
-
-def noise_adaptive_filter(values, threshold=0.1):
-    """Adapt filter parameters based on noise level"""
-    if len(values) < 3:
-        return np.mean(values) if values else 0
-        
-    # Calculate noise level (standard deviation)
-    noise_level = np.std(values)
-    
-    if noise_level < threshold:
-        # Low noise - use less aggressive filtering
-        return np.mean(values)
-    else:
-        # High noise - use median (more robust)
-        return np.median(values)
+    # Hanya gunakan 3 nilai terakhir untuk responsivitas
+    recent_data = list(data)[-3:]
+    return np.median(recent_data)
 
 def main_uwb_transmitter():
     # Inisialisasi port serial UWB
@@ -104,8 +62,8 @@ def main_uwb_transmitter():
     UDP_PORT = 5005           # Port untuk komunikasi
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     
-    # Window size untuk berbagai filter
-    window_size = 10  # Jendela yang lebih besar untuk lingkungan bermasalah
+    # Gunakan window kecil agar responsif
+    window_size = 5
     
     # Data history untuk setiap anchor
     history = {
@@ -114,29 +72,29 @@ def main_uwb_transmitter():
         'A2': deque(maxlen=window_size)
     }
     
-    # Inisialisasi Kalman Filter untuk setiap anchor
+    # Inisialisasi Kalman Filter dengan parameter lebih responsif
     kalman_filters = {
-        'A0': KalmanFilter(process_variance=0.01, measurement_variance=0.5),
-        'A1': KalmanFilter(process_variance=0.01, measurement_variance=0.5),
-        'A2': KalmanFilter(process_variance=0.01, measurement_variance=0.5)
+        'A0': AdaptiveKalmanFilter(process_variance=0.125, measurement_variance=0.5),
+        'A1': AdaptiveKalmanFilter(process_variance=0.125, measurement_variance=0.5),
+        'A2': AdaptiveKalmanFilter(process_variance=0.125, measurement_variance=0.5)
     }
     
-    # Nilai terakhir yang valid untuk physical constraint
-    last_valid_values = {
+    # Nilai terakhir yang valid
+    last_values = {
         'A0': None,
         'A1': None,
         'A2': None
     }
     
-    # Pengukuran waktu untuk physical constraints
-    last_measurement_time = time.time()
-    
-    # Statistik untuk adaptasi filter
-    stats = {
-        'A0': {'std': 0, 'values': deque(maxlen=30)},
-        'A1': {'std': 0, 'values': deque(maxlen=30)},
-        'A2': {'std': 0, 'values': deque(maxlen=30)}
+    # Pendeteksi stabilitas - melacak berapa lama nilai stabil
+    stability_counter = {
+        'A0': 0,
+        'A1': 0,
+        'A2': 0
     }
+    
+    # Nilai delta untuk mendeteksi pergerakan signifikan
+    movement_threshold = 0.1
     
     try:
         while True:
@@ -149,11 +107,6 @@ def main_uwb_transmitter():
                     try:
                         parts = line.split(",")
                         if len(parts) >= 4:
-                            # Hitung delta waktu sejak pengukuran terakhir
-                            current_time = time.time()
-                            time_delta = current_time - last_measurement_time
-                            last_measurement_time = current_time
-                            
                             # Konversi data ke float; jika data "null" maka di-set ke None
                             raw_values = {
                                 'A0': float(parts[1]) if parts[1].lower() != "null" else None,
@@ -162,62 +115,59 @@ def main_uwb_transmitter():
                             }
                             
                             filtered_values = {}
+                            movement_detected = False
                             
                             for key in raw_values:
                                 # Skip jika nilai null
                                 if raw_values[key] is None:
-                                    filtered_values[key] = last_valid_values[key] if last_valid_values[key] is not None else 0.0
+                                    # Gunakan nilai terakhir jika ada
+                                    filtered_values[key] = last_values[key] if last_values[key] is not None else 0.0
                                     continue
                                 
-                                # 1. Deteksi outlier
-                                is_outlier = detect_outliers(raw_values[key], list(history[key]), 2.5)
+                                # Tambahkan ke history
+                                history[key].append(raw_values[key])
                                 
-                                if is_outlier and last_valid_values[key] is not None:
-                                    # Gunakan nilai sebelumnya jika outlier terdeteksi
-                                    value = last_valid_values[key]
-                                else:
-                                    # 2. Terapkan physical constraints
-                                    value = constrain_by_physics(
-                                        raw_values[key], 
-                                        last_valid_values[key], 
-                                        max_change=1.5,  # Maksimum perubahan dalam meter/detik
-                                        time_delta=time_delta
-                                    )
-                                    
-                                    # Update history untuk filter
-                                    history[key].append(value)
-                                    
-                                    # Update statistik untuk adaptasi filter
-                                    stats[key]['values'].append(value)
-                                    if len(stats[key]['values']) > 5:
-                                        stats[key]['std'] = np.std(list(stats[key]['values']))
-                                    
-                                    # 3. Terapkan median filter untuk outlier lainnya
-                                    median_value = median_filter(list(history[key]), window_size)
-                                    
-                                    # 4. Terapkan EWMA untuk smoothing
-                                    if len(history[key]) > 2:
-                                        ewma_value = exponential_weighted_moving_average(list(history[key]))
+                                # Deteksi pergerakan signifikan
+                                if last_values[key] is not None:
+                                    delta = abs(raw_values[key] - last_values[key])
+                                    if delta > movement_threshold:
+                                        movement_detected = True
+                                        stability_counter[key] = 0
                                     else:
-                                        ewma_value = value
-                                    
-                                    # 5. Gunakan Kalman Filter untuk final smoothing dan prediction
-                                    kalman_value = kalman_filters[key].update(ewma_value)
-                                    
-                                    # 6. Pilih filter berdasarkan tingkat noise
-                                    if stats[key]['std'] > 0.3:  # Noise tinggi
-                                        # Lingkungan bermasalah (high noise) - gunakan Kalman
-                                        value = kalman_value
-                                    elif stats[key]['std'] > 0.1:  # Noise sedang
-                                        # Noise sedang - gunakan median
-                                        value = median_value
-                                    else:  # Noise rendah
-                                        # Noise rendah - gunakan EWMA
-                                        value = ewma_value
+                                        stability_counter[key] += 1
                                 
-                                # Simpan nilai terakhir yang valid
-                                last_valid_values[key] = value
-                                filtered_values[key] = value
+                                # Jika stabil terlalu lama (stuck), paksa reset
+                                force_reset = stability_counter[key] > 10
+                                
+                                # FILTERING STRATEGY:
+                                # 1. Saat mendeteksi gerakan, gunakan nilai mentah dengan median filter ringan
+                                # 2. Saat stabil, gunakan Kalman filter adaptif
+                                
+                                if movement_detected or len(history[key]) < 3:
+                                    # Gunakan median filter ringan saja saat bergerak
+                                    median_val = median_filter(history[key], 3)
+                                    # Kalman masih diupdate tapi dengan bobot rendah (tracking mode)
+                                    kalman_val = kalman_filters[key].update(median_val, force_update=True)
+                                    # Saat bergerak, percayai median filter lebih banyak
+                                    filtered_values[key] = median_val * 0.7 + kalman_val * 0.3
+                                else:
+                                    # Mode stabil - gunakan Kalman untuk smoothing
+                                    # tapi tetap responsif terhadap perubahan
+                                    kalman_val = kalman_filters[key].update(raw_values[key])
+                                    median_val = median_filter(history[key], window_size)
+                                    
+                                    # Mix keduanya - tetap responsif tapi stabil
+                                    filtered_values[key] = kalman_val * 0.7 + median_val * 0.3
+                                
+                                # Force reset jika terlalu lama stabil - mencegah "stuck"
+                                if force_reset:
+                                    filtered_values[key] = raw_values[key]
+                                    kalman_filters[key].estimate = raw_values[key]
+                                    print(f"Reset filter {key} - nilai stabil terlalu lama")
+                                    stability_counter[key] = 0
+                                
+                                # Simpan nilai terakhir
+                                last_values[key] = raw_values[key]
                             
                             # Format nilai filtered menjadi string dengan 3 desimal
                             formatted_values = [
@@ -226,18 +176,25 @@ def main_uwb_transmitter():
                                 f"{filtered_values['A2']:.3f}"
                             ]
                             
+                            # Format nilai mentah untuk debug
+                            raw_formatted = [
+                                f"{raw_values['A0']:.3f}" if raw_values['A0'] is not None else "null",
+                                f"{raw_values['A1']:.3f}" if raw_values['A1'] is not None else "null",
+                                f"{raw_values['A2']:.3f}" if raw_values['A2'] is not None else "null"
+                            ]
+                            
                             # Gabungkan data untuk dikirim
                             uwb_data = ",".join(formatted_values)
                             
                             # Kirim data ke Raspberry Pi 2 melalui UDP
                             sock.sendto(uwb_data.encode(), (UDP_IP, UDP_PORT))
                             
-                            # Tampilkan output dengan info noise level
-                            noise_levels = [f"A{i} noise: {stats[f'A{i}']['std']:.3f}" for i in range(3)]
-                            noise_info = ", ".join(noise_levels)
-                            print(f"Data terkirim: {uwb_data} | {noise_info}")
+                            # Tampilkan output dengan raw dan filtered untuk perbandingan
+                            raw_data = ",".join(raw_formatted)
+                            status = "MOVING" if movement_detected else "STABLE"
+                            print(f"Raw: {raw_data} | Filtered: {uwb_data} | Status: {status}")
                             
-                        # Jeda singkat untuk memastikan tidak terjadi overload
+                        # Jeda singkat
                         time.sleep(0.001)
                     
                     except Exception as e:
