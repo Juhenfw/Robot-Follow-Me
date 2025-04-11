@@ -1,13 +1,15 @@
 import pygame
 import time
 import ddsm115 as motor
-import glob
 import os
 import serial
-from serial.tools import list_ports
 
 class RobotController:
     def __init__(self):
+        # Port tetap yang ditentukan
+        self.r_wheel_port = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_B0049TUZ-if00-port0"
+        self.l_wheel_port = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_B0045S9B-if00-port0"
+        
         # Inisialisasi Pygame
         pygame.init()
         self.screen = pygame.display.set_mode((400, 300))
@@ -30,143 +32,155 @@ class RobotController:
         self.motor1 = None
         self.motor2 = None
         self.connect_motors()
+        
+        # Status error dan reconnect
+        self.consecutive_errors = 0
+        self.max_consecutive_errors = 5
+        self.last_error_time = 0
+        self.error_timeout = 2  # Detik
     
-    def find_ddsm115_ports(self):
-        """Menemukan port yang terhubung dengan motor DDSM115"""
-        print("Mencari port DDSM115...")
-        
-        # Metode 1: Coba cari port berdasarkan ID (lebih disukai)
-        ports = glob.glob("/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_*")
-        if len(ports) >= 2:
-            return ports[:2]  # Ambil 2 port pertama
-            
-        # Metode 2: Cari semua port serial yang tersedia
-        available_ports = [port.device for port in list_ports.comports() 
-                          if "USB" in port.description]
-        
-        if len(available_ports) >= 2:
-            return available_ports[:2]
-            
-        # Metode 3: Cari port ACM atau USB generik
-        tty_ports = glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*")
-        
-        if len(tty_ports) >= 2:
-            return tty_ports[:2]
-            
-        print("PERINGATAN: Tidak dapat menemukan cukup port untuk motor!")
-        return [], []
+    def verify_port_exists(self, port):
+        """Memverifikasi apakah port tersedia"""
+        return os.path.exists(port)
     
     def connect_motors(self):
-        """Menghubungkan ke motor dan mencoba lagi jika gagal"""
-        ports = self.find_ddsm115_ports()
+        """Menghubungkan ke motor dengan port tetap"""
+        # Cek ketersediaan port roda kanan
+        if self.verify_port_exists(self.r_wheel_port):
+            try:
+                print(f"Menghubungkan motor kanan ke {self.r_wheel_port}")
+                self.motor1 = motor.MotorControl(device=self.r_wheel_port)
+                self.motor1.set_drive_mode(1, 2)
+                print("Motor kanan berhasil terhubung")
+            except Exception as e:
+                print(f"KESALAHAN saat menghubungkan motor kanan: {e}")
+                self.motor1 = None
+        else:
+            print(f"PERINGATAN: Port motor kanan tidak ditemukan: {self.r_wheel_port}")
+            self.motor1 = None
         
-        if len(ports) < 2:
-            print("KESALAHAN: Tidak cukup port ditemukan untuk kedua motor.")
-            return False
+        # Cek ketersediaan port roda kiri
+        if self.verify_port_exists(self.l_wheel_port):
+            try:
+                print(f"Menghubungkan motor kiri ke {self.l_wheel_port}")
+                self.motor2 = motor.MotorControl(device=self.l_wheel_port)
+                self.motor2.set_drive_mode(1, 2)
+                print("Motor kiri berhasil terhubung")
+            except Exception as e:
+                print(f"KESALAHAN saat menghubungkan motor kiri: {e}")
+                self.motor2 = None
+        else:
+            print(f"PERINGATAN: Port motor kiri tidak ditemukan: {self.l_wheel_port}")
+            self.motor2 = None
         
-        try:
-            print(f"Menghubungkan motor kanan ke {ports[0]}")
-            self.motor1 = motor.MotorControl(device=ports[0])
-            self.motor1.set_drive_mode(1, 2)
-            
-            print(f"Menghubungkan motor kiri ke {ports[1]}")
-            self.motor2 = motor.MotorControl(device=ports[1])
-            self.motor2.set_drive_mode(1, 2)
-            
-            # Tes motor untuk memastikan koneksi
-            self.motor1.send_rpm(1, 0)
-            self.motor2.send_rpm(1, 0)
-            
+        # Uji koneksi untuk memastikan berfungsi
+        if self.motor1:
+            try:
+                self.motor1.send_rpm(1, 0)
+            except:
+                print("Pengujian motor kanan gagal")
+                self.motor1 = None
+        
+        if self.motor2:
+            try:
+                self.motor2.send_rpm(1, 0)
+            except:
+                print("Pengujian motor kiri gagal")
+                self.motor2 = None
+        
+        # Periksa status koneksi
+        if self.motor1 and self.motor2:
             print("Kedua motor berhasil terhubung!")
             return True
-        except Exception as e:
-            print(f"KESALAHAN saat menghubungkan motor: {e}")
-            # Coba tutup koneksi jika ada
-            if self.motor1:
-                try:
-                    self.motor1.close()
-                except:
-                    pass
-            if self.motor2:
-                try:
-                    self.motor2.close()
-                except:
-                    pass
-            
+        elif self.motor1 or self.motor2:
+            print("PERINGATAN: Hanya satu motor yang terhubung")
+            return True
+        else:
+            print("KESALAHAN: Kedua motor gagal terhubung")
             return False
     
     def safe_send_rpm(self, motor_obj, motor_id, speed):
         """Mengirim RPM dengan penanganan kesalahan"""
+        if not motor_obj:
+            return False
+            
         try:
             motor_obj.send_rpm(motor_id, speed)
             return True
         except Exception as e:
-            print(f"Kesalahan komunikasi motor: {e}")
+            current_time = time.time()
+            # Catat error
+            if current_time - self.last_error_time > self.error_timeout:
+                print(f"Kesalahan komunikasi motor: {e}")
+                self.last_error_time = current_time
             return False
     
     def reconnect_if_needed(self):
-        """Memeriksa koneksi motor dan menghubungkan ulang jika perlu"""
-        reconnect_needed = False
+        """Mencoba menghubungkan ulang jika ada masalah"""
+        # Cek apakah perlu reconnect
+        need_reconnect = False
         
-        # Periksa motor 1
+        # Tes motor kanan jika terhubung
         if self.motor1:
             try:
-                # Coba kirim perintah kecepatan 0 sebagai tes koneksi
                 self.motor1.send_rpm(1, 0)
             except:
-                print("Motor kanan terputus, mencoba menghubungkan ulang...")
-                reconnect_needed = True
+                need_reconnect = True
+                print("Motor kanan terputus, perlu menghubungkan ulang")
         else:
-            reconnect_needed = True
+            need_reconnect = True
         
-        # Periksa motor 2
+        # Tes motor kiri jika terhubung
         if self.motor2:
             try:
-                # Coba kirim perintah kecepatan 0 sebagai tes koneksi
                 self.motor2.send_rpm(1, 0)
             except:
-                print("Motor kiri terputus, mencoba menghubungkan ulang...")
-                reconnect_needed = True
+                need_reconnect = True
+                print("Motor kiri terputus, perlu menghubungkan ulang")
         else:
-            reconnect_needed = True
+            need_reconnect = True
         
-        # Reconnect jika diperlukan
-        if reconnect_needed:
-            # Coba tutup koneksi sebelumnya
+        # Lakukan reconnect jika diperlukan
+        if need_reconnect:
+            # Tutup koneksi yang ada
             if self.motor1:
                 try:
                     self.motor1.close()
                 except:
                     pass
+                self.motor1 = None
+                
             if self.motor2:
                 try:
                     self.motor2.close()
                 except:
                     pass
+                self.motor2 = None
             
             # Tunggu sebentar sebelum reconnect
             time.sleep(1)
+            
+            # Coba menghubungkan ulang
             return self.connect_motors()
         
         return True
     
     def run(self):
         """Menjalankan loop utama kontrol robot"""
-        retry_count = 0
-        max_retries = 5
+        self.consecutive_errors = 0
         
         while self.running:
-            # Periksa koneksi motor secara berkala
-            if retry_count >= 3:  # Setelah beberapa kesalahan berturut-turut
-                if not self.reconnect_if_needed():
-                    retry_count += 1
-                    if retry_count > max_retries:
-                        print("Terlalu banyak percobaan gagal, keluar...")
-                        break
-                    time.sleep(1)  # Tunggu sebelum mencoba lagi
-                    continue
+            # Cek untuk reconnect jika terlalu banyak error berturut-turut
+            if self.consecutive_errors >= 3:
+                print(f"Terdeteksi {self.consecutive_errors} error berturut-turut, mencoba menghubungkan ulang...")
+                if self.reconnect_if_needed():
+                    self.consecutive_errors = 0
                 else:
-                    retry_count = 0
+                    self.consecutive_errors += 1
+                    if self.consecutive_errors > self.max_consecutive_errors:
+                        print("Terlalu banyak kegagalan koneksi berturut-turut, keluar...")
+                        break
+                    time.sleep(1)  # Tunggu sebentar sebelum coba lagi
             
             # Proses event Pygame
             self.screen.fill((0, 0, 0))  # Bersihkan layar
@@ -232,20 +246,22 @@ class RobotController:
                 self.current_speed_lwheel = self.stop
             
             # Kirim perintah ke motor dengan penanganan kesalahan
-            if self.motor1 and self.motor2:
-                success1 = self.safe_send_rpm(self.motor1, 1, self.current_speed_rwheel)
-                success2 = self.safe_send_rpm(self.motor2, 1, self.current_speed_lwheel)
-                
-                if not (success1 and success2):
-                    retry_count += 1
-                    print(f"Komunikasi motor gagal (upaya ke-{retry_count})")
-                else:
-                    retry_count = 0  # Reset counter jika berhasil
+            success1 = self.safe_send_rpm(self.motor1, 1, self.current_speed_rwheel)
+            success2 = self.safe_send_rpm(self.motor2, 1, self.current_speed_lwheel)
+            
+            # Periksa status error
+            if not (success1 and success2):
+                self.consecutive_errors += 1
+                # Jangan tampilkan pesan jika sudah terlalu banyak
+                if self.consecutive_errors <= 3:
+                    print(f"Komunikasi motor gagal (upaya ke-{self.consecutive_errors})")
             else:
-                print("Motor tidak terhubung!")
-                retry_count += 1
+                self.consecutive_errors = 0  # Reset counter jika berhasil
             
             self.clock.tick(30)  # Batasi ke 30 FPS
+            
+            # Tambahkan penundaan kecil untuk mengurangi beban CPU
+            time.sleep(0.01)
     
     def cleanup(self):
         """Membersihkan dan menutup koneksi"""
