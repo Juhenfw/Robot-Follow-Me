@@ -296,9 +296,14 @@ class GamepadController:
             button_rb = joystick.get_button(5)
             button_lb = joystick.get_button(4)
             button_back = joystick.get_button(8)
+            button_switch = joystick.get_button(9)
 
             # Mode switching logic
-            if button_back:  # Switch to Autonomous mode
+            if button_back:  # Close the program
+                print("Closing Program")
+                return "close"
+
+            if button_switch:  # Switch to Autonomous mode
                 print("Switching to Autonomous Mode")
                 return "autonomous"
 
@@ -372,15 +377,14 @@ def main_robot_loop():
 
     try:
         print("Starting robot...")
+        mode = "manual"  # Default mode is manual
         while True:
-            # Gamepad manual mode
-            mode = gamepad_controller.run(robot, lidar_processor, uwb_tracker)
-            if mode == "autonomous":
-                print("Switching to Autonomous Mode")
+            if mode == "manual":
+                mode = gamepad_controller.run(robot, lidar_processor, uwb_tracker)
+            elif mode == "autonomous":
                 while True:
                     data, addr = sock.recvfrom(1024)
                     parts = data.decode().split(",")
-
                     raw_uwb_distances['A0'] = float(parts[0])
                     raw_uwb_distances['A1'] = float(parts[1])
                     raw_uwb_distances['A2'] = float(parts[2])
@@ -393,7 +397,9 @@ def main_robot_loop():
 
                     robot.analyze_and_act(corrected_distances)
                     time.sleep(0.00001)
-
+                    # Check if we should switch back to manual mode
+                    if mode != "autonomous":
+                        break
     except KeyboardInterrupt:
         print("Terminating robot process.")
     finally:
