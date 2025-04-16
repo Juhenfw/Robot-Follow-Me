@@ -410,3 +410,8 @@ def main_robot_loop():
 
 if __name__ == "__main__":
     main_robot_loop()
+
+            # if self.joystick.get_button(9):  # Tombol switch mode
+            #     self.mode = MODE_AUTONOMOUS if self.mode == MODE_GAMEPAD else MODE_GAMEPAD
+            #     print("Mode diubah ke:", "AUTONOMOUS" if self.mode == MODE_AUTONOMOUS else "GAMEPAD")
+            #     time.sleep(0.3)
