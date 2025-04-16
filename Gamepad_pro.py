@@ -19,7 +19,6 @@ class RobotController:
         self.speed = self.base_speed
         self.lambat = self.speed / 4
         self.serong = self.speed / 3
-        self.drift_boost = self.speed * 1.3
         self.stop = 0
 
         self.running = True
@@ -82,17 +81,24 @@ class RobotController:
             pygame.event.pump()
             joystick = self.joystick
 
-            axis_lr = joystick.get_axis(0)  # Sumbu kiri-kanan (belok)
-            axis_fb = joystick.get_axis(1)  # Sumbu depan-belakang (maju/mundur)
-            button_a = joystick.get_button(1)  # Tombol A - Maju (Gas)
-            button_x = joystick.get_button(0)  # Tombol X - Mundur
-            button_back = joystick.get_button(8)  # Tombol Back - Exit
+            # Mengakses axis (Sumbu joystick)
+            axis_lr = joystick.get_axis(0)  # Sumbu kiri-kanan (belok) - Joystick kiri
+            axis_fb = joystick.get_axis(1)  # Sumbu depan-belakang (maju/mundur) - Joystick kiri
+            axis_lr_r = joystick.get_axis(2)  # Sumbu kanan-kanan untuk rotasi
+            axis_fb_r = joystick.get_axis(3)  # Sumbu vertikal kanan untuk rotasi
+
+            # Tombol-tombol aksi
+            button_a = joystick.get_button(0)  # Tombol A (Maju)
+            button_x = joystick.get_button(2)  # Tombol X (Mundur)
+            button_rb = joystick.get_button(5)  # Tombol RB (Tambah Kecepatan)
+            button_lb = joystick.get_button(4)  # Tombol LB (Kurang Kecepatan)
+            button_back = joystick.get_button(6)  # Tombol Back untuk keluar
 
             deadzone = 0.2
             self.current_speed_rwheel = self.stop
             self.current_speed_lwheel = self.stop
 
-            # Kontrol maju dan mundur dengan tombol A dan X
+            # Kontrol maju (A) dan mundur (X) dengan tombol
             if button_a:  # MAJU (Gas)
                 self.current_speed_rwheel = int(self.speed * axis_fb)
                 self.current_speed_lwheel = int(self.speed * axis_fb)
@@ -101,11 +107,23 @@ class RobotController:
                 self.current_speed_rwheel = int(-self.speed * axis_fb)
                 self.current_speed_lwheel = int(-self.speed * axis_fb)
 
-            # Sistem belok kompleks menggunakan joystick analog (axis_lr dan axis_fb)
+            # Sistem belok kompleks dengan joystick analog kiri (kiri-kanan)
             if abs(axis_lr) > deadzone or abs(axis_fb) > deadzone:
-                # Belok kanan/kiri dan maju/mundur berdasarkan sumbu analog
                 self.current_speed_rwheel = int(self.speed * axis_fb - axis_lr * self.serong)
                 self.current_speed_lwheel = int(self.speed * axis_fb + axis_lr * self.serong)
+
+            # Rotasi halus dengan joystick kanan (axis_lr_r dan axis_fb_r)
+            if abs(axis_lr_r) > deadzone or abs(axis_fb_r) > deadzone:
+                self.current_speed_rwheel += int(self.speed * axis_fb_r - axis_lr_r * self.serong)
+                self.current_speed_lwheel += int(self.speed * axis_fb_r + axis_lr_r * self.serong)
+
+            # Tombol RB untuk menambah kecepatan
+            if button_rb:
+                self.speed = min(self.base_speed * 2, self.speed + 10)
+
+            # Tombol LB untuk mengurangi kecepatan
+            if button_lb:
+                self.speed = max(self.base_speed / 2, self.speed - 10)
 
             # Tombol Back untuk keluar dari program
             if button_back:
