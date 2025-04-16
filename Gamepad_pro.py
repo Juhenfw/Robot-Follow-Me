@@ -2,6 +2,89 @@ import pygame
 import time
 import ddsm115 as motor
 import os
+import usb
+import struct
+
+USB_VENDOR = 0x046d
+USB_PRODUCT = 0xc21d
+default_state = (0, 20, 0, 0, 0, 0, 123, 251, 128, 0, 128, 0, 128, 0, 0, 0, 0, 0, 0, 0)
+
+class Gamepad(object):
+
+    def __init__(self, serial=None):
+        """ Initialize the gamepad.
+        Args:
+            serial: Serial number of the gamepad. If None, the first gamepad found is used.
+        """
+        self.is_initialized = False
+        d = None
+        busses = usb.busses()
+        for bus in busses:
+            devs = bus.devices
+            for dev in devs:
+                if dev.idVendor == 0x046d and dev.idProduct == 0xc21d:
+                    if serial is not None and usb.util.get_string(dev.dev, dev.iSerialNumber) != serial:
+                        continue
+                    d = dev
+        if not d is None:
+            self._dev = d.open()
+            try:
+                self._dev.detachKernelDriver(0)
+            except usb.core.USBError:
+                pass
+            self._dev.setConfiguration(1)
+            self._dev.claimInterface(0)
+            self._dev.interruptWrite(0x02, struct.pack('<BBB', 0x01, 0x03, 0x04))
+            self._state = default_state
+            self._old_state = default_state
+            self.is_initialized = True
+            print("Gamepad initialized")
+        else:
+            if serial is not None:
+                raise RuntimeError(f"Device with serial number '{serial}' not found")
+            raise RuntimeError("Could not initialize Gamepad")
+
+    def _getState(self, timeout):
+        try:
+            data = self._dev.interruptRead(0x81, 0x20, timeout=timeout)
+            data = struct.unpack('<' + 'B' * 20, data)
+            return data
+        except usb.core.USBError as e:
+            return None
+
+    def read_gamepad(self, timeout=200):
+        state = self._getState(timeout=timeout)
+        self.changed = state is not None
+        if self.changed:
+            self._old_state = self._state
+            self._state = state
+
+    def get_state(self):
+        return self._state[:]
+
+    def get_A(self):
+        return self._state[3] == 16
+
+    def get_X(self):
+        return self._state[3] == 64
+
+    def get_analogL_x(self):
+        return self._state[6]
+
+    def get_analogL_y(self):
+        return self._state[8]
+
+    def get_analogR_x(self):
+        return self._state[11]
+
+    def get_analogR_y(self):
+        return self._state[12]
+
+    def __del__(self):
+        if self.is_initialized:
+            self._dev.releaseInterface()
+            self._dev.reset()
+
 
 class RobotController:
     def __init__(self):
@@ -29,15 +112,8 @@ class RobotController:
         self.motor2 = None
         self.connect_motors()
 
-        # Joystick
-        pygame.joystick.init()
-        if pygame.joystick.get_count() > 0:
-            self.joystick = pygame.joystick.Joystick(0)
-            self.joystick.init()
-            print("Joystick terdeteksi dan diinisialisasi")
-        else:
-            print("Joystick tidak terdeteksi. Harap colokkan dan restart.")
-            self.running = False
+        # Inisialisasi Gamepad
+        self.gamepad = Gamepad()
 
     def verify_port_exists(self, port):
         return os.path.exists(port)
@@ -78,68 +154,36 @@ class RobotController:
                 if event.type == pygame.QUIT:
                     self.running = False
 
-            pygame.event.pump()
-            joystick = self.joystick
+            # Membaca status gamepad
+            self.gamepad.read_gamepad()
 
-            # Mengakses axis (Sumbu joystick)
-            axis_lr = joystick.get_axis(0)  # Sumbu kiri-kanan (belok) - Joystick kiri
-            axis_fb = joystick.get_axis(1)  # Sumbu depan-belakang (maju/mundur) - Joystick kiri
-            axis_lr_r = joystick.get_axis(2)  # Sumbu kanan-kanan untuk rotasi
-            axis_fb_r = joystick.get_axis(3)  # Sumbu vertikal kanan untuk rotasi
+            if self.gamepad.get_A():  # Tombol A untuk maju
+                self.current_speed_rwheel = self.speed
+                self.current_speed_lwheel = self.speed
 
-            # Tombol-tombol aksi
-            button_a = joystick.get_button(0)  # Tombol A (Maju)
-            button_x = joystick.get_button(2)  # Tombol X (Mundur)
-            button_rb = joystick.get_button(5)  # Tombol RB (Tambah Kecepatan)
-            button_lb = joystick.get_button(4)  # Tombol LB (Kurang Kecepatan)
-            button_back = joystick.get_button(6)  # Tombol Back untuk keluar
+            if self.gamepad.get_X():  # Tombol X untuk mundur
+                self.current_speed_rwheel = -self.speed
+                self.current_speed_lwheel = -self.speed
 
-            deadzone = 0.2
-            self.current_speed_rwheel = self.stop
-            self.current_speed_lwheel = self.stop
+            # Kontrol analog untuk belok dan maju/mundur
+            axis_lr = self.gamepad.get_analogL_x()  # Joystick kiri - kiri/kanan
+            axis_fb = self.gamepad.get_analogL_y()  # Joystick kiri - atas/bawah
 
-            # Kontrol maju (A) dan mundur (X) dengan tombol
-            if button_a:  # MAJU (Gas)
-                self.current_speed_rwheel = int(self.speed * axis_fb)
-                self.current_speed_lwheel = int(self.speed * axis_fb)
-
-            if button_x:  # MUNDUR
-                self.current_speed_rwheel = int(-self.speed * axis_fb)
-                self.current_speed_lwheel = int(-self.speed * axis_fb)
-
-            # Sistem belok kompleks dengan joystick analog kiri (kiri-kanan)
-            if abs(axis_lr) > deadzone or abs(axis_fb) > deadzone:
+            # Mengatur kecepatan dan belok
+            if abs(axis_lr) > 0.2 or abs(axis_fb) > 0.2:
                 self.current_speed_rwheel = int(self.speed * axis_fb - axis_lr * self.serong)
                 self.current_speed_lwheel = int(self.speed * axis_fb + axis_lr * self.serong)
 
-            # Rotasi halus dengan joystick kanan (axis_lr_r dan axis_fb_r)
-            if abs(axis_lr_r) > deadzone or abs(axis_fb_r) > deadzone:
-                self.current_speed_rwheel += int(self.speed * axis_fb_r - axis_lr_r * self.serong)
-                self.current_speed_lwheel += int(self.speed * axis_fb_r + axis_lr_r * self.serong)
-
-            # Tombol RB untuk menambah kecepatan
-            if button_rb:
-                self.speed = min(self.base_speed * 2, self.speed + 10)
-
-            # Tombol LB untuk mengurangi kecepatan
-            if button_lb:
-                self.speed = max(self.base_speed / 2, self.speed - 10)
-
-            # Tombol Back untuk keluar dari program
-            if button_back:
-                self.running = False
-
-            # Kirim kecepatan ke motor
+            # Kirim perintah RPM ke motor
             self.safe_send_rpm(self.motor1, 1, self.current_speed_rwheel)
             self.safe_send_rpm(self.motor2, 1, self.current_speed_lwheel)
 
             self.clock.tick(30)
             time.sleep(0.01)
 
-            print(f"Kecepatan = {self.speed}")
+            print(f"Kecepatan: {self.speed}")
 
     def cleanup(self):
-        print("Menutup koneksi motor...")
         if self.motor1:
             try:
                 self.motor1.send_rpm(1, 0)
@@ -153,6 +197,7 @@ class RobotController:
             except:
                 pass
         pygame.quit()
+
 
 if __name__ == "__main__":
     robot = RobotController()
