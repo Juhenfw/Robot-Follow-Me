@@ -1,0 +1,3 @@
+if crc error (ddsm115)
+-> sudo udevadm trigger
+-> Then run the code again
