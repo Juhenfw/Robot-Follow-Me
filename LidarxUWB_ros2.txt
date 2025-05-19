@@ -1,0 +1,30 @@
+Cara Menggunakan Kode Dalam Environment ROS 2
+
+-> Simpan file dengan nama following_robot_node.py di folder src dalam paket ROS 2 Anda
+------------------------------------------------------------------------------
+-> Tambahkan entri file ke setup.py di paket ROS 2 Anda:
+
+entry_points={
+    'console_scripts': [
+        'following_robot_node = your_package.following_robot_node:main',
+    ],
+},
+
+-------------------------------------------------------------------------------
+
+-> Buat file launch untuk memudahkan menjalankan node:
+
+# following_robot_launch.py
+from launch import LaunchDescription
+from launch_ros.actions import Node
+def generate_launch_description():
+    return LaunchDescription([
+        Node(
+            package='your_package',
+            executable='following_robot_node',
+            name='following_robot',
+            parameters=[
+                {'lidar_port': '/dev/ttyUSB0'},
+                {'
+
+---------------------------------------------------------------------------------
