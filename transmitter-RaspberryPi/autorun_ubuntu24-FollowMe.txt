@@ -1,0 +1,83 @@
+senban01@senban01:~$ code
+senban01@senban01:~$ sudo nano /etc/systemd/system/uwb_olahan3_kompleks.service
+[sudo] password for : 
+----------------------------------------------------------------------
+Isinya:
+
+[Unit]
+Description=UWB Olahan3 Kompleks Python Service
+After=network.target
+
+[Service]
+Type=simple
+User=ympipa
+ExecStart=/home/ympipa/myenv/bin/python /home/ympipa/myenv/main/UWB/uwb_olahan3>
+WorkingDirectory=/home/ympipa/myenv/main/UWB
+Restart=always
+RestartSec=5
+Environment=PATH=/home/ympipa/myenv/bin:/usr/bin:/bin
+Environment=VIRTUAL_ENV=/home/ympipa/myenv
+
+[Install]
+WantedBy=multi-user.target
+
+-----------------------------------------------------------------------
+
+senban01@senban01:~$ sudo systemctl daemon-reload
+sudo systemctl enable uwb_olahan3_kompleks.service
+
+output terminal:
+Created symlink /etc/systemd/system/multi-user.target.wants/uwb_olahan3_kompleks.service → /etc/systemd/system/uwb_olahan3_kompleks.service
+
+
+senban01@senban01:~$ sudo systemctl start uwb_olahan3_kompleks.service
+senban01@senban01:~$ sudo systemctl status uwb_olahan3_kompleks.service
+
+output terminal:
+● uwb_olahan3_kompleks.service - Relay SQL IN/OUT Autostart Service
+     Loaded: loaded (/etc/systemd/system/uwb_olahan3_kompleks.service; enabled; preset: enabled)
+     Active: active (running) since Mon 2025-06-02 10:30:30 WIB; 7s ago
+   Main PID: 7172 (python)
+      Tasks: 4 (limit: 4324)
+     Memory: 80.8M (peak: 87.4M)
+        CPU: 1.206s
+     CGroup: /system.slice/uwb_olahan3_kompleks.service
+             └─7172 /home/senban01/rs485env/bin/python /home/senban01/rs485env/relay_rs485/relay_sql_inout.py
+
+Jun 02 10:30:30 senban01 systemd[1]: Started relay_sql_inout.service - Relay SQL IN/OUT Autostart Service.
+
+Jika kamu ingin mengganti kode program yang dijalankan oleh service, ada dua pilihan tergantung apa yang kamu ubah:
+🔁 A. Kamu hanya mengubah isi file Python (relay_sql_inout.py)
+
+    Misalnya: kamu edit logika atau perintah di /home/senban01/rs485env/relay_rs485/relay_sql_inout.py
+
+✅ Tidak perlu ubah service!
+Cukup:
+
+sudo systemctl restart relay_sql_inout.service
+
+Ini akan memuat ulang service dan menjalankan versi terbaru dari file Python.
+📝 B. Kamu ingin mengganti ke file program Python lain
+
+    Misalnya: kamu ingin menjalankan /home/senban01/rs485env/relay_rs485/relay2.py sebagai pengganti
+
+✅ Kamu harus edit file .service:
+
+    Edit file service:
+
+sudo nano /etc/systemd/system/relay_sql_inout.service
+
+Ubah bagian ini:----------------
+
+ExecStart=/home/senban01/rs485env/bin/python /home/senban01/rs485env/relay_rs485/relay_sql_inout.py
+
+menjadi:
+
+ExecStart=/home/senban01/rs485env/bin/python /home/senban01/rs485env/relay_rs485/relay_sql_v2.py
+
+Simpan dan keluar (Ctrl+O, Enter, lalu Ctrl+X)
+
+Reload dan restart service:
+
+sudo systemctl daemon-reload
+sudo systemctl restart relay_sql_inout.service
