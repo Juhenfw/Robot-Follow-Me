@@ -1,0 +1,171 @@
+*Using ROS 2 Jazzy for LIDAR A2M12 Slamtec*
+
+source /opt/ros/jazzy/setup.bash
+cd ~
+mkdir -p ~/ws_lidar/src
+cd ~/ws_lidar/src
+
+Clone the remote repository:
+git clone https://github.com/Slamtec/sllidar_ros2.git
+
+lalu check using:
+ls -la
+
+Build ROS 2 package:
+cd ~/ws_lidar/
+colcon build --symlink-install
+
+check again using:
+ls -la
+
+ignore some compilation warning, and then you need to source the created package:
+source ~/ws_lidar/install/setup.bash
+
+check port using:
+ls -la /dev | grep USB
+
+untuk membuka permission:
+sudo chmod 777 /dev/ttyUSB0  -->  bisa diubah sesuai dengan port yang dipakai
+
+run:
+ros2 launch sllidar_ros2 view_sllidar_a2m12_launch.py  <-- Menjalankan Lidar dengan Rviz
+
+for see all the type of slamtec Lidar:
+ls -la ~/ws_lidar/src/sllidar_ros2/launch
+
+
+
+Rencana Struktur:
+~/ros2_ws/
+├── src/
+│   ├── lidar_sensor/           # Paket untuk LIDAR
+│   │   ├── lidar_sensor/       # Folder kode LIDAR
+│   │   │   ├── __init__.py     # Inisialisasi paket
+│   │   │   └── lidar_node.py   # Kode untuk mengontrol LIDAR
+│   │   ├── launch/             # Folder untuk file launch
+│   │   │   └── lidar_launch.py # File launch untuk node LIDAR
+│   │   ├── setup.py            # Setup untuk paket LIDAR
+│   │   └── package.xml         # Definisi paket LIDAR
+│   │
+│   ├── wheel_control/          # Paket untuk kontrol roda DDSM115
+│   │   ├── wheel_control/      # Folder kode kontrol motor
+│   │   │   ├── __init__.py     # Inisialisasi paket
+│   │   │   └── motor_control.py# Kode untuk mengontrol motor
+│   │   ├── launch/             # Folder untuk file launch
+│   │   │   └── wheel_launch.py # File launch untuk node motor
+│   │   ├── setup.py            # Setup untuk paket motor
+│   │   └── package.xml         # Definisi paket motor
+│   │
+│   ├── uwb_sensor/             # Paket untuk sensor UWB HR-RTLS1
+│   │   ├── uwb_sensor/         # Folder kode sensor UWB
+│   │   │   ├── __init__.py     # Inisialisasi paket
+│   │   │   └── uwb_node.py     # Kode untuk membaca data dari UWB
+│   │   ├── launch/             # Folder untuk file launch
+│   │   │   └── uwb_launch.py   # File launch untuk node UWB
+│   │   ├── setup.py            # Setup untuk paket UWB
+│   │   └── package.xml         # Definisi paket UWB
+│   │
+│   ├── gamepad_control/        # Paket untuk kontrol gamepad
+│   │   ├── gamepad_control/    # Folder kode gamepad
+│   │   │   ├── __init__.py     # Inisialisasi paket
+│   │   │   └── gamepad_control.py# Kode untuk membaca input gamepad
+│   │   ├── launch/             # Folder untuk file launch
+│   │   │   └── gamepad_launch.py# File launch untuk node gamepad
+│   │   ├── setup.py            # Setup untuk paket gamepad
+│   │   └── package.xml         # Definisi paket gamepad
+│   │
+│   ├── robot_description/      # Deskripsi robot (URDF/XACRO)
+│   │   ├── urdf/               # Folder URDF/XACRO
+│   │   │   └── robot.urdf      # Deskripsi robot dalam format URDF
+│   │   ├── launch/             # Folder untuk file launch
+│   │   │   └── robot_state_publisher_launch.py # File launch untuk robot_state_publisher
+│   │   ├── setup.py            # Setup untuk deskripsi robot
+│   │   └── package.xml         # Definisi paket deskripsi robot
+│
+└── launch/
+    └── robot_launch.py         # File Launch untuk meluncurkan semua node
+
+
+
+/dev/ttyLIDAR -> ttyUSB0
+
+/dev/ttyRS485-2 -> ttyUSB1
+
+/dev/ttyRS485-1 -> ttyUSB2
+
+/dev/gamepad_logitech -> input/event6
+
+
+sudo nano /etc/udev/rules.d/99-custom-usb.rules                                                                 
+# CP210x (LIDAR FT32 Serial UART)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", ATTRS{busnum}=="2", ATTRS{devpath}=="1", SYMLINK+="ttyLIDAR"
+
+# FTDI USB Serial Device - Perangkat 1
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", ATTRS{busnum}=="2", ATTRS{devpath}=="2.1", SYMLINK+="ttyRS485-1"
+
+# FTDI USB Serial Device - Perangkat 2
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", ATTRS{busnum}=="2", ATTRS{devpath}=="2.2", SYMLINK+="ttyRS485-2"
+
+# Logitech F710 Gamepad
+SUBSYSTEM=="input", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c21f", SYMLINK+="gamepad_logitech"
+
+sudo udevadm control --reload-rules && sudo udevadm trigger
+
+
+cd ~/ros2_ws
+colcon build --packages-select gamepad_robot_controller
+ls ~/ros2_ws/install/gamepad_robot_controller/lib/python*/site-packages/gamepad_robot_controller/
+ros2 launch gamepad_robot_controller gamepad_controller.launch.py
+
+
+cd ~/ros2_ws
+colcon build --packages-select rplidar_ros
+source ./install/setup.bash
+
+
+-- FINDING USB DEVICE --
+Method 1: Using udevadm
+Connect your FTDI devices to the USB ports
+Identify the current device names assigned by the system:
+ls -l /dev/ttyUSB*
+
+Get detailed attributes for one of the devices (replace X with the appropriate number):
+udevadm info -a -n /dev/ttyUSBX
+
+Look for these specific attributes in the output:
+ATTRS{busnum}=="X"
+ATTRS{devpath}=="X.X"
+
+Cek Joystick
+jstest /dev/input/js0
+
+
+https://i-0a9531c90708cb835.robotigniteacademy.com/37a7ca42-0992-40ae-98b7-b0abf0d15454/jupyter_rds/notebooks/basics.ipynb
+
+https://i-0a9531c90708cb835.robotigniteacademy.com/37a7ca42-0992-40ae-98b7-b0abf0d15454/jupyter_rds/notebooks/topics.ipynb
+
+izin akses:
+chmod +x ~/ros2_ws/src/robot_control_system/robot_control_system/keyboard_mode_controller.py
+chmod +x ~/ros2_ws/src/robot_control_system/robot_control_system/simple_keyboard_controller.py
+
+
+Dijalankan Barengan:
+ros2 run robot_control_system mode_switcher
+ros2 launch robot_control_system robot_system.launch.py
+ros2 topic echo /robot/current_mode
+
+Membangun ulang package
+cd ~/ros2_ws
+colcon build --packages-select robot_control_system
+source install/setup.bash
+
+Roda DDSM 115
+MAJU = L+,R-
+MUNDUR = L-,R+
+KIRI = L-,R-
+KANAN = L+,R+
+
+Awalan
+cd ~/ros2_ws
+source /opt/ros/jazzy/setup.bash
+source ./install/setup.bash
