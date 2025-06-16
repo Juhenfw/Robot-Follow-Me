@@ -3,54 +3,77 @@
 ## Persiapan Lingkungan
 
 1. Mengatur Direktori Workspace
+   ```bash
    source /opt/ros/jazzy/setup.bash
    cd ~
    mkdir -p ~/ros2_ws/src
    cd ~/ros2_ws/src
+   ```
 
-2. Clone Repositori (Contoh menggunakan repo rplidar):
+3. Clone Repositori (Contoh menggunakan repo rplidar):
+   ```bash
    git clone https://github.com/Slamtec/sllidar_ros2.git
+   ```
 
-3. Periksa Isi Direktori:
+5. Periksa Isi Direktori:
+   ```bash
    ls -la
+   ```
 
 ## Membangun ROS 2 Package
 
 1. Melakukan Build:
+   ```bash
    cd ~/ros2_ws/
    colcon build --symlink-install
+   ```
 
-2. Periksa Kembali:
+3. Periksa Kembali:
+   ```bash
    ls -la
+   ```
 
-3. Compile:
+5. Compile:
+   ```bash
    source ~/ros2_ws/install/setup.bash
+   ```
 
-4. Menjalankan LIDAR:
+7. Menjalankan LIDAR:
+   ```bash
    ros2 launch sllidar_ros2 view_sllidar_a2m12_launch.py
+   ```
 
 ## Cek Port dan Izin Akses
 
 1. Cek Port USB Terhubung:
+   ```bash
    ls -la /dev | grep USB
+   ```
 
-2. Membuka Permission:
+3. Membuka Permission:
    - Untuk membuka izin akses ke port:
+     ```bash
      sudo chmod 777 /dev/ttyUSB0  # Ubah sesuai port yang digunakan
+     ```
    - Atau bisa menggunakan:
+     ```bash
      sudo chmod 666 /dev/ttyUSB0  # Ubah sesuai port yang digunakan
+     ```
 
 ## Konfigurasi Port USB
-
-- /dev/ttyLIDAR -> ttyUSB0
-- /dev/ttyRS485-2 -> ttyUSB1
-- /dev/ttyRS485-1 -> ttyUSB2
-- /dev/gamepad_logitech -> input/event6
+```bash
+/dev/ttyLIDAR -> ttyUSB0
+/dev/ttyRS485-2 -> ttyUSB1
+/dev/ttyRS485-1 -> ttyUSB2
+/dev/gamepad_logitech -> input/event6
+```
 
 ## Fiksasi Port USB
 
 1. Menambahkan Aturan USB:
+   ```bash
    sudo nano /etc/udev/rules.d/99-custom-usb.rules
+   ```
 
    Isi dengan aturan berikut:
    ```bash
@@ -67,10 +90,12 @@
    SUBSYSTEM=="input", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c21f", SYMLINK+="gamepad_logitech"
    ```
 
-2. Simpan dan Terapkan Aturan:
+3. Simpan dan Terapkan Aturan:
    - Tekan Ctrl+O, Enter, kemudian Ctrl+X untuk keluar dari editor.
    - Terapkan aturan:
+     ```bash
      sudo udevadm control --reload-rules && sudo udevadm trigger
+     ```
 
 ## Mencari Device USB
 
@@ -78,42 +103,58 @@
 
 1. Hubungkan perangkat FTDI ke port USB.
 2. Identifikasi nama perangkat yang terhubung:
+   ```bash
    ls -l /dev/ttyUSB*
+   ```
 
-3. Dapatkan atribut detail untuk perangkat tertentu:
+4. Dapatkan atribut detail untuk perangkat tertentu:
    Ganti X dengan nomor yang sesuai:
+   ```bash
    udevadm info -a -n /dev/ttyUSBX
+   ```
 
-4. Periksa atribut spesifik dalam output:
+6. Periksa atribut spesifik dalam output:
+   ```bash
    ATTRS{busnum}=="X"
    ATTRS{devpath}=="X.X"
+   ```
 
 ## Cek Joystick
 
 Untuk memeriksa input dari joystick:
+```bash
 jstest /dev/input/js0
+```
 
 ## Izin Akses pada Script
 
 1. Berikan izin eksekusi pada file controller:
+   ```bash
    chmod +x ~/ros2_ws/src/robot_control_system/robot_control_system/keyboard_mode_controller.py
    chmod +x ~/ros2_ws/src/robot_control_system/robot_control_system/simple_keyboard_controller.py
+   ```
 
 ## Membangun Ulang Package
 
 1. Membangun ulang package:
+   ```bash
    cd ~/ros2_ws
    colcon build --packages-select robot_control_system
+   ```
 
-2. Sumberkan setup:
+3. Sumberkan setup:
+   ```bash
    source install/setup.bash
+   ```
 
 ## Kontrol Roda DDSM 115
 
-- Maju: L+, R-
-- Mundur: L-, R+
-- Kiri: L-, R-
-- Kanan: L+, R+
+| Arah   | Kiri (L) | Kanan (R) |
+|--------|----------|-----------|
+| Maju   | L+       | R-        |
+| Mundur | L-       | R+        |
+| Kiri   | L-       | R-        |
+| Kanan  | L+       | R+        |
 
 ## Struktur Direktori
 
