@@ -1,5 +1,5 @@
-senban01@senban01:~$ code
-senban01@senban01:~$ sudo nano /etc/systemd/system/uwb_olahan3_kompleks.service
+~$ code
+~$ sudo nano /etc/systemd/system/uwb_olahan3_kompleks.service
 [sudo] password for : 
 ----------------------------------------------------------------------
 Isinya:
@@ -23,15 +23,15 @@ WantedBy=multi-user.target
 
 -----------------------------------------------------------------------
 
-senban01@senban01:~$ sudo systemctl daemon-reload
+~$ sudo systemctl daemon-reload
 sudo systemctl enable uwb_olahan3_kompleks.service
 
 output terminal:
 Created symlink /etc/systemd/system/multi-user.target.wants/uwb_olahan3_kompleks.service → /etc/systemd/system/uwb_olahan3_kompleks.service
 
 
-senban01@senban01:~$ sudo systemctl start uwb_olahan3_kompleks.service
-senban01@senban01:~$ sudo systemctl status uwb_olahan3_kompleks.service
+~$ sudo systemctl start uwb_olahan3_kompleks.service
+~$ sudo systemctl status uwb_olahan3_kompleks.service
 
 output terminal:
 ● uwb_olahan3_kompleks.service - Relay SQL IN/OUT Autostart Service
